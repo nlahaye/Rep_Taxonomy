@@ -1,0 +1,22 @@
+out_dir: /data/experiments/reptaxonomy/outputs
+seed: 42
+n_runs: 3
+
+dataset:
+  dataset_name: ben_ge
+
+model_names:
+  - clay_v1
+  - satmae_large
+  - prithvi_100m
+
+projections:
+  - umap
+  - tsne
+  - pca
+
+number_of_bootstraps: 10
+ase_n_components: 1
+top_frac: 0.1
+
+

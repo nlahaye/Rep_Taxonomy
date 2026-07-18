@@ -1,0 +1,10 @@
+out_dir: /data/experiments/reptaxonomy/outputs
+dataset: ben_ge
+alpha: 0.05
+
+model_names:
+  - clay_v1
+  - satmae_large
+  - prithvi_100m
+
+

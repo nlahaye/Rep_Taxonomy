@@ -1,0 +1,19 @@
+embed_dir: /data/experiments/reptaxonomy/embeddings
+seed: 42
+
+encoder:
+  _target_: mypackage.encoders.build_encoder
+  model_name: clay_v1
+  checkpoint_path: /data/checkpoints/clay_v1.ckpt
+
+dataset:
+  dataset_name: ben_ge
+
+ww_min_evals: 50
+ww_max_evals: 5000
+ww_randomize: true
+ww_mp_fit: true
+ww_pool: true
+ww_layers: []
+
+
