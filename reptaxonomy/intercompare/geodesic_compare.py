@@ -4,35 +4,17 @@ import pathlib
 import pprint
 import time
 
+import argparse
+
 import numpy as np
 import pandas as pd
 
-import hydra
 import torch
-from hydra.conf import HydraConf
-from hydra.core.hydra_config import HydraConfig
-from hydra import initialize, compose
-from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
 
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from pangaea.datasets.base import GeoFMDataset, GeoFMSubset, RawGeoFMDataset
-from pangaea.encoders.base import Encoder
-from pangaea.engine.evaluator import Evaluator
-from pangaea.engine.trainer import Trainer
-from pangaea.utils.collate_fn import get_collate_fn
-from pangaea.utils.logger import init_logger
-from pangaea.utils.subset_sampler import get_subset_indices
-from pangaea.utils.utils import (
-    fix_seed,
-    get_best_model_ckpt_path,
-    get_final_model_ckpt_path,
-    get_generator,
-    seed_worker,
-)
 
 import math
 import zarr
@@ -44,6 +26,7 @@ from sklearn import metrics
 
 import scipy
 
+from reptaxonomy.util.general_utils import resolve_model_names, resolve_projections, read_yaml
 
 def pairwise_geometry_similarity(a, b):
     """
@@ -139,62 +122,17 @@ def load_representation_builder(rep_name: str):
 
 
 
-@hydra.main(version_base=None, config_path="../../configs", config_name="geodesics")
-def main(cfg: DictConfig) -> None:
-    """Geofm-bench main function.
-
-    Args:
-        cfg (DictConfig): main_config
-    """
+def run_geodesic_compare(cfg):
 
     default="geo_euc",
     choices=["euc", "cos", "abs", "geo_euc", "geo_ig", "geo_sphere"],
 
-    # fix all random seeds
-    fix_seed(cfg.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    exp_name = 'embed_projection'
-    exp_dir = './'
-    exp_dir = pathlib.Path(cfg.work_dir) / exp_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    task_name='Embed_project'
-    logger_path = os.path.join(exp_dir,'embed_project.log')
-
-    logger = init_logger(logger_path, rank=0)
-    logger.info("============ Initialized logger ============")
-    logger.info(pprint.pformat(OmegaConf.to_container(cfg), compact=True).strip("{}"))
-    logger.info("The experiment is stored in %s\n" % exp_dir)
-    logger.info(f"Device used: {device}")
-
-    OmegaConf.save(cfg, "tmp_geodesics.yaml") 
-
-    choices = OmegaConf.to_container(HydraConfig.get().runtime.choices)
-
-    model_names = [
-        "croma_optical",
-        "dofa",
-        #"gfmswin",
-        "prithvi",
-        "satlasnet_si",
-        #"scalemae",
-        #"spectralgpt",
-        #"ssl4eo_data2vec",
-        #"ssl4eo_dino",
-        #"ssl4eo_mae_optical",
-        #"ssl4eo_moco",
-        "unet_encoder",
-        "terramind_large",
-        "resnet50_scratch",
-        "resnet50_pretrained",
-        "vit_scratch",
-        "vit"
-    ]
-
-
+    model_names = resolve_model_names(cfg)
+    projections = resolve_projections(cfg) 
+ 
     #Get/make directories
-    embed_dir = os.path.join(cfg.embed_dir,cfg.dataset.dataset_name)
-    indices_dir = os.path.join(cfg.out_dir,cfg.dataset.dataset_name)
+    embed_dir = os.path.join(cfg["embed_dir"],cfg["dataset"]["dataset_name"])
+    indices_dir = os.path.join(cfg["out_dir"],cfg["dataset"]["dataset_name"])
 
     embeddings = {}
     targets = {}
@@ -205,7 +143,7 @@ def main(cfg: DictConfig) -> None:
 
         cfg = compose(config_name="tmp_geodesics", overrides=["encoder=" + model_name])
 
-        encoder: Encoder = instantiate(cfg.encoder)
+        encoder: Encoder = instantiate(cfg["encoder"])
         encoder.load_encoder_weights(logger)
         logger.info("Built {}.".format(encoder.model_name))
 
@@ -214,21 +152,21 @@ def main(cfg: DictConfig) -> None:
 
         # Evaluation
         test_preprocessor = instantiate(
-            cfg.preprocessing.test,
-            dataset_cfg=cfg.dataset,
+            cfg["preprocessing.test"],
+            dataset_cfg=cfg["dataset"],
             encoder_cfg=model_name,
             _recursive_=False,
         )
 
         # get datasets
-        raw_test_dataset: RawGeoFMDataset = instantiate(cfg.dataset, split="test")
+        raw_test_dataset: RawGeoFMDataset = instantiate(cfg["dataset"], split="test")
         test_dataset = GeoFMDataset(raw_test_dataset, test_preprocessor)
 
         test_loader = DataLoader(
             test_dataset,
             # sampler=DistributedSampler(test_dataset),
-            batch_size=cfg.test_batch_size,
-            num_workers=cfg.test_num_workers,
+            batch_size=cfg["test_batch_size"],
+            num_workers=cfg["test_num_workers"],
             pin_memory=True,
             persistent_workers=False,
             drop_last=False,
@@ -257,9 +195,7 @@ def main(cfg: DictConfig) -> None:
             if os.path.exists(crop_info_fname):
                 crop_info = np.load(crop_info_fname, allow_pickle=True).item()
 
-            #print(crop_info)
 
-            #print(embed_fname,  cfg.dataset.img_size)
             for k, v in image.items():
                 crop_info = crop_info[k]
                 img_size = v[:, :, 0, :, :].shape
@@ -299,7 +235,7 @@ def main(cfg: DictConfig) -> None:
 
 
 
-    builder, module = load_representation_builder(cfg.representation)
+    builder, module = load_representation_builder(cfg["representation"])
 
 
     for anchor_model in model_names:
@@ -319,14 +255,14 @@ def main(cfg: DictConfig) -> None:
 
             transformed[model_name] = rep
 
-            out_path = os.path.join(out_dir, f"{anchor_name}_anchored_{model_name}_{cfg.representation}.npy")
+            out_path = os.path.join(out_dir, f"{anchor_name}_anchored_{model_name}_{cfg["representation"]}.npy")
             np.save(out_path, rep)
 
             manifest_rows.append(
                 {
                     "model": model_name,
                     "anchor": anchor_name,
-                    "representation": cfg.representation,
+                    "representation": cfg["representation"],
                     "input_samples": int(x.shape[0]),
                     "input_dim": int(x.shape[1]),
                     "output_samples": int(rep.shape[0]),
@@ -336,7 +272,7 @@ def main(cfg: DictConfig) -> None:
             )
 
             pd.DataFrame(manifest_rows).to_csv(
-                os.path.join(out_dir, f"{anchor_name}_anchored_{cfg.representation}_representation_manifest.csv"),
+                os.path.join(out_dir, f"{anchor_name}_anchored_{cfg["representation"]}_representation_manifest.csv"),
                 index=False,
             )
   
@@ -358,21 +294,25 @@ def main(cfg: DictConfig) -> None:
                 row = {
                     "model_a": m1,
                     "model_b": m2,
-                    "representation": cfg.representation,
+                    "representation": cfg["representation"],
                     "n_compared": n,
                     **metrics,
                 }
                 pair_rows.append(row)
  
         pair_df = pd.DataFrame(pair_rows)
-        pair_df.to_csv(os.path.join(out_dir, f"{anchor_name}_anchored_{cfg.representation}_pairwise_comparison.csv"), index=False)
+        pair_df.to_csv(os.path.join(out_dir, f"{anchor_name}_anchored_{cfg["representation"]}_pairwise_comparison.csv"), index=False)
  
         print(pair_df.sort_values("pairwise_distance_spearman", ascending=False))
 
 
 if __name__ == "__main__":
-    main()
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-y", "--yaml", help="YAML config file.")
+    args = parser.parse_args()
+    cfg = read_yaml(args.yaml)
+    run_geodesic_compare(cfg)
 
 
 
