@@ -19,27 +19,7 @@ from calflops import calculate_flops
 from codecarbon import EmissionsTracker
 
 from reptaxonomy.util.general_utils import read_yaml
-from gfmtools.data.datasets.epa import EPALabels
-from gfmtools.data.datasets.hlsburnscars import HLSBurnScars
-from gfmtools.data.datasets.landfire import LandfireDataset
-from gfmtools.models.resnet import ResNetEncoder
-from gfmtools.models.swin import SwinEncoder
-from gfmtools.models.dofa import DofaEncoder
-from gfmtools.models.unet import unet
-
-
-DATASET_CLASS_REGISTRY = {
-    "EPALabels": EPALabels,
-    "HLSBurnScars": HLSBurnScars,
-    "LandfireDataset": LandfireDataset,
-}
-
-MODEL_CLASS_REGISTRY = {
-    "ResNetEncoder": ResNetEncoder,
-    "SwinEncoder": SwinEncoder,
-    "DofaEncoder": DofaEncoder,
-    "unet": unet,
-}
+from reptaxonomy.experiment_init_utils import MODEL_CLASS_REGISTRY, DATASET_CLASS_REGISTRY
 
 
 def ensure_dir(path: str) -> str:
