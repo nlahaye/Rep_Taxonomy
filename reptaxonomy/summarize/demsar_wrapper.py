@@ -11,7 +11,6 @@ import pandas as pd
 from reptaxonomy.util.general_utils import read_yaml
 from demsar_rank import run_demsar
 
-from reptaxonomy.util.general_utils import read_yaml
 
 def load_json(path: Path) -> Any:
     with open(path, "r") as f:
@@ -33,6 +32,42 @@ def aggregate_mean_std(
     )
     out[std_name] = out[std_name].fillna(0.0)
     return out
+
+
+def resolve_dataset_name(cfg: dict[str, Any]) -> str:
+    dataset_bundle = cfg.get("dataset_bundle")
+    if isinstance(dataset_bundle, dict):
+        dataset_spec = dataset_bundle.get("dataset_spec", {})
+        if isinstance(dataset_spec, dict):
+            name = dataset_spec.get("dataset_name") or dataset_spec.get("name")
+            if name:
+                return str(name)
+
+    dataset_cfg = cfg.get("dataset")
+    if isinstance(dataset_cfg, dict):
+        name = dataset_cfg.get("dataset_name") or dataset_cfg.get("name")
+        if name:
+            return str(name)
+
+    if isinstance(dataset_cfg, str):
+        return dataset_cfg
+
+    raise ValueError("Could not resolve dataset name from cfg['dataset_bundle'] or cfg['dataset'].")
+
+
+def resolve_model_names(cfg: dict[str, Any]) -> list[str]:
+    model_names_cfg = cfg.get("model_names")
+    if isinstance(model_names_cfg, (str, Path)):
+        model_names = load_json(Path(model_names_cfg))
+    elif isinstance(model_names_cfg, list):
+        model_names = model_names_cfg
+    else:
+        raise ValueError("model_names must be either a list or a path to a JSON file")
+
+    if not isinstance(model_names, list) or not model_names:
+        raise ValueError("model_names must resolve to a non-empty list")
+
+    return [str(x) for x in model_names]
 
 
 def build_silhouette_inputs(
@@ -268,21 +303,10 @@ def load_yaml_config(path: Path) -> dict[str, Any]:
 
 
 def demsar_wrapper(cfg):
-
     out_dir = Path(cfg["out_dir"])
-    dataset_name = str(cfg["dataset"])
+    dataset_name = resolve_dataset_name(cfg)
     alpha = float(cfg.get("alpha", 0.05))
-
-    model_names_cfg = cfg["model_names"]
-    if isinstance(model_names_cfg, (str, Path)):
-        model_names = load_json(Path(model_names_cfg))
-    elif isinstance(model_names_cfg, list):
-        model_names = model_names_cfg
-    else:
-        raise ValueError("model_names must be either a list or a path to a JSON file")
-
-    if not isinstance(model_names, list) or not model_names:
-        raise ValueError("model_names must resolve to a non-empty list")
+    model_names = resolve_model_names(cfg)
 
     metric_specs, written_files = build_all_demsar_inputs(
         output_dir=out_dir,
@@ -306,3 +330,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     cfg = read_yaml(args.yaml)
     demsar_wrapper(cfg)
+
+

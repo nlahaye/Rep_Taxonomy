@@ -1,11 +1,10 @@
-
-import os
-import math
-import pathlib
-import pprint
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
 import argparse
+import logging
+import math
+import os
+from typing import Any, Dict, List, Tuple
 
 import joblib
 import numpy as np
@@ -15,23 +14,40 @@ import torch
 import torch.nn.functional as F
 import umap
 import zarr
+import openTSNE
 
-from scipy.sparse import csr_array, save_npz, load_npz
-import scipy.sparse as sp
+from scipy.sparse import csr_array, save_npz
 from sklearn import metrics
-
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader
 
-import openTSNE
-
 from reptaxonomy.util.general_utils import read_yaml
+from reptaxonomy.util.experiment_init_utils import build_test_loader
+from reptaxonomy.artifacts import (
+    ensure_dict,
+    get_dataset_name,
+    get_model_name,
+    get_projections,
+    dataset_out_root,
+    run_dir,
+    dataset_run_dir,
+    embedding_file_path,
+    crop_info_file_path,
+    embed_subset_path,
+    target_subset_path,
+    projection_path,
+    projection_label_tif_path,
+    knn_graph_path,
+    reducer_model_path,
+    silhouette_stats_path,
+    index_cache_path,
+    run_manifest_path,
+    build_run_manifest,
+    save_json,
+)
 
-
-def ensure_dir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
+logger = logging.getLogger(__name__)
 
 
 def center_mask(shape_info: Tuple[int, int], frac_low: float = 0.15, frac_high: float = 0.85) -> np.ndarray:
@@ -46,17 +62,35 @@ def center_mask(shape_info: Tuple[int, int], frac_low: float = 0.15, frac_high: 
     )
 
 
-def build_sparse_knn_graph(X: np.ndarray, k: int, metric: str = "euclidean", symmetrize: bool = True) -> csr_array:
+def infer_hw_from_crop(crop_info: Any) -> Tuple[int, int]:
+    if crop_info is None:
+        raise ValueError("crop_info is None")
+    return int(crop_info[0][-2]), int(crop_info[0][-1])
+
+
+def build_sparse_knn_graph(
+    X: np.ndarray,
+    k: int,
+    metric: str = "euclidean",
+    symmetrize: bool = True,
+) -> csr_array:
     n_neighbors = min(k + 1, X.shape[0])
     nn = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, n_jobs=-1)
     nn.fit(X)
     _, indices = nn.kneighbors(X, return_distance=True)
+
     if indices.shape[1] > 1:
         indices = indices[:, 1:]
+
     rows = np.repeat(np.arange(X.shape[0]), indices.shape[1])
     cols = indices.reshape(-1)
     data = np.ones_like(cols, dtype=np.int8)
-    graph = csr_array((data, (rows, cols)), shape=(X.shape[0], X.shape[0]), dtype=np.int8)
+
+    graph = csr_array(
+        (data, (rows, cols)),
+        shape=(X.shape[0], X.shape[0]),
+        dtype=np.int8,
+    )
     if symmetrize:
         graph = graph.maximum(graph.T)
     return graph
@@ -66,14 +100,23 @@ def save_sparse_graph(graph: csr_array, out_path: str) -> None:
     save_npz(out_path, graph, compressed=True)
 
 
+def get_indices(
+    cfg: Dict[str, Any],
+    run_idx: int,
+    image_fname: str,
+    target: np.ndarray,
+    shape_info: Tuple[int, int],
+) -> np.ndarray:
+    index_fname = index_cache_path(cfg, run_idx, image_fname)
+    os.makedirs(os.path.dirname(index_fname), exist_ok=True)
 
-def get_indices(cfg, image_fname: str, target: np.ndarray, indices_dir: str, shape_info: Tuple[int, int]) -> np.ndarray:
-    index_fname = os.path.join(indices_dir, os.path.splitext(image_fname)[0] + ".indices.zarr")
     if os.path.exists(index_fname):
         return zarr.load(index_fname)
 
-    n_classes = cfg["dataset"]["num_classes"]
-    ignore_class = cfg["dataset"]["ignore_index"]
+    n_classes = int(cfg["dataset"]["num_classes"])
+    ignore_class = int(cfg["dataset"]["ignore_index"])
+    label_file_subset = int(cfg["label_file_subset"])
+
     c_mask = center_mask(shape_info)
     selected = []
 
@@ -83,8 +126,8 @@ def get_indices(cfg, image_fname: str, target: np.ndarray, indices_dir: str, sha
         valid = np.where((target == cls) & c_mask)[0]
         if valid.size == 0:
             continue
-        if valid.size > cfg["label_file_subset"]
-            valid = np.random.choice(valid, size=cfg["label_file_subset"], replace=False)
+        if valid.size > label_file_subset:
+            valid = np.random.choice(valid, size=label_file_subset, replace=False)
         selected.append(valid.astype(np.int32, copy=False))
 
     final_inds = np.concatenate(selected, axis=0) if selected else np.empty((0,), dtype=np.int32)
@@ -92,9 +135,7 @@ def get_indices(cfg, image_fname: str, target: np.ndarray, indices_dir: str, sha
     return final_inds
 
 
-
-
-def rescale_embed(embed: np.ndarray, image_shape: int, target, crop_info=None) -> Tuple[np.ndarray, np.ndarray]:
+def rescale_embed(embed: np.ndarray, image_shape: int, target: Any, crop_info: Any = None) -> Tuple[np.ndarray, np.ndarray]:
     ind = 1 if embed.ndim > 3 else 0
     tensor = torch.from_numpy(embed)
 
@@ -108,9 +149,7 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target, crop_info=None) -
         tensor = tensor.unsqueeze(0)
     else:
         tensor = torch.flatten(tensor, start_dim=0, end_dim=1).unsqueeze(0)
- 
-    #Assumption is currently square images + tiles 
-    #Adjusting to account for potential off-by-ones
+
     if tensor.shape[-1] != image_shape:
         tensor = F.interpolate(tensor, size=(image_shape, image_shape), mode="nearest")
 
@@ -118,6 +157,7 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target, crop_info=None) -
 
     if crop_info is not None:
         out_h, out_w = int(crop_info[0][-2]), int(crop_info[0][-1])
+
         full_tensor = torch.zeros((tensor.shape[0], tensor.shape[1], out_h, out_w), dtype=tensor.dtype)
         full_tensor[:, :, crop_info[1]:crop_info[1] + crop_info[3], crop_info[2]:crop_info[2] + crop_info[4]] = tensor
         tensor = full_tensor
@@ -128,51 +168,63 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target, crop_info=None) -
 
     target_np = target_np.reshape(-1)
     embed_np = tensor.permute(0, 2, 3, 1).reshape(-1, tensor.shape[1]).numpy()
-
     return embed_np, target_np
 
 
-def fit_or_load_projection(embed: np.ndarray, out_dir: str, cfg, projection: str) -> np.ndarray:
-    reducer_fname = os.path.join(out_dir, f"{projection}_model.joblib")
+def fit_or_load_projection(
+    embed: np.ndarray,
+    cfg: Dict[str, Any],
+    run_idx: int,
+    projection: str,
+) -> np.ndarray:
+    reducer_fname = reducer_model_path(cfg, run_idx, projection)
 
     if projection == "umap":
         if os.path.exists(reducer_fname):
             reducer = joblib.load(reducer_fname)
-            print("UMAP projecting data", embed.shape)
+            logger.info("UMAP projecting data %s", embed.shape)
             return reducer.transform(embed)
-        print("Training UMAP and projecting data", embed.shape)
+
+        logger.info("Training UMAP and projecting data %s", embed.shape)
         reducer = umap.UMAP(
             metric="cosine",
-            n_neighbors=cfg["umap_n_neighbors"],
-            min_dist=cfg["umap_min_dist"],
-            n_components=cfg["umap_n_components"],
-            spread=cfg["umap_spread"],
-            random_state=cfg["seed"],
+            n_neighbors=int(cfg["umap_n_neighbors"]),
+            min_dist=float(cfg["umap_min_dist"]),
+            n_components=int(cfg["umap_n_components"]),
+            spread=float(cfg["umap_spread"]),
+            random_state=int(cfg["seed"]),
         )
         proj = reducer.fit_transform(embed)
+
     elif projection == "pca":
         if os.path.exists(reducer_fname):
             reducer = joblib.load(reducer_fname)
-            print("Projecting PCs", embed.shape)    
+            logger.info("Projecting PCs %s", embed.shape)
             return reducer.transform(embed)
-        print("Computing PCs and projecting data", embed.shape)
-        reducer = PCA(n_components=min(getattr(cfg, "pca_max_components", 64), embed.shape[1]))
+
+        logger.info("Computing PCs and projecting data %s", embed.shape)
+        reducer = PCA(n_components=min(int(cfg.get("pca_max_components", 64)), embed.shape[1]))
         proj = reducer.fit_transform(embed)
-    else:
+
+    elif projection == "tsne":
         if os.path.exists(reducer_fname):
             reducer = joblib.load(reducer_fname)
-            print("TSNE projecting data", embed.shape)
+            logger.info("TSNE projecting data %s", embed.shape)
             return reducer.transform(embed)
-        print("Training TSNE and projecting data", embed.shape)
+
+        logger.info("Training TSNE and projecting data %s", embed.shape)
         reducer = openTSNE.TSNE(
-            n_jobs=getattr(cfg, "tsne_n_jobs", 8),
+            n_jobs=int(cfg.get("tsne_n_jobs", 8)),
             verbose=True,
             metric="cosine",
             exaggeration=4,
-            random_state=cfg["seed"],
+            random_state=int(cfg["seed"]),
         )
         reducer = reducer.fit(embed)
         proj = reducer.transform(embed)
+
+    else:
+        raise ValueError(f"Unsupported projection: {projection}")
 
     joblib.dump(reducer, reducer_fname)
     return proj
@@ -188,6 +240,7 @@ def normalize_projection_for_raster(projection_data: np.ndarray, scale: float = 
 def write_projection_label_tif(projection_data: np.ndarray, target_full: np.ndarray, out_file: str) -> None:
     y = projection_data[:, 0].astype(np.int32)
     x = projection_data[:, 1].astype(np.int32)
+
     final_projection = np.full((int(y.max()) + 1, int(x.max()) + 1), -1, dtype=np.int32)
     final_projection[y, x] = target_full
 
@@ -201,131 +254,180 @@ def write_projection_label_tif(projection_data: np.ndarray, target_full: np.ndar
         "tiled": False,
         "interleave": "band",
     }
+
     with rasterio.open(out_file, "w", **ras_meta) as dst:
         dst.write(final_projection, 1)
 
 
-
-def build_projection_artifacts(embed_full: np.ndarray, target_full: np.ndarray, out_subdir: str, cfg, dataset_name: str, encoder_name: str) -> List[Dict]:
+def build_projection_artifacts(
+    cfg: Dict[str, Any],
+    run_idx: int,
+    embed_full: np.ndarray,
+    target_full: np.ndarray,
+) -> List[Dict[str, Any]]:
     rows = []
-    for projection in PROJECTIONS:
-        projection_data = fit_or_load_projection(embed_full, out_subdir, cfg, projection)
+    projection_names = get_projections(cfg)
+    model_name = get_model_name(cfg)
+
+    for projection in projection_names:
+        projection_data = fit_or_load_projection(embed_full, cfg, run_idx, projection)
         projection_2d = normalize_projection_for_raster(projection_data)
 
-        out_file = os.path.join(out_subdir, f"{encoder_name}.{projection.upper()}_Labels.tif")
-        write_projection_label_tif(projection_2d, target_full, out_file)
+        tif_path = projection_label_tif_path(cfg, run_idx, projection, model_name=model_name)
+        write_projection_label_tif(projection_2d, target_full, tif_path)
+
+        projection_save_path = projection_path(cfg, run_idx, projection, model_name=model_name)
+        np.save(projection_save_path, projection_data[:, :2])
 
         silhouette = metrics.silhouette_score(projection_data[:, :2], target_full)
-        rows.append({
+
+        row = {
+            "run": run_idx,
             "projection": projection,
-            "model": encoder_name,
+            "model": model_name,
             "mean_sil": float(silhouette),
             "std_sil": 0.0,
-        })
+            "n_points": int(projection_data.shape[0]),
+            "projection_path": projection_save_path,
+            "label_tif_path": tif_path,
+        }
 
-        if getattr(cfg, "build_knn", True):
+        if bool(cfg.get("build_knn", True)):
             k = max(2, int(np.log(max(3, projection_2d.shape[0]))))
-            graph = build_sparse_knn_graph(projection_data[:, :2], k=k, metric=getattr(cfg, "knn_metric", "euclidean"))
-            knn_fpath = os.path.join(out_subdir, f"{encoder_name}.{dataset_name}.{projection.upper()}.knn_graph.npz")
-            save_sparse_graph(graph, knn_fpath)
+            graph = build_sparse_knn_graph(
+                projection_data[:, :2],
+                k=k,
+                metric=str(cfg.get("knn_metric", "euclidean")),
+            )
+            graph_path = knn_graph_path(cfg, run_idx, projection, model_name=model_name)
+            save_sparse_graph(graph, graph_path)
+            row["knn_graph_path"] = graph_path
+            row["knn_k"] = int(k)
+            row["knn_metric"] = str(cfg.get("knn_metric", "euclidean"))
 
-        np.save(os.path.join(out_subdir, f"{encoder_name}.{dataset_name}.{projection.upper()}.projection.npy"), projection_data[:, :2])
+        rows.append(row)
 
     return rows
 
 
 
 
-def run_knn_gen(cfg):
+def run_knn_gen(cfg: Dict[str, Any]) -> None:
+    cfg = ensure_dict(cfg, "run_projections cfg")
 
+    model_name = get_model_name(cfg)
+    dataset_name = get_dataset_name(cfg)
+    n_runs = int(cfg.get("n_runs", 3))
+    seed = int(cfg.get("seed", 42))
 
-    #TODO expected input format
+    np.random.seed(seed)
+    dataset_out_root(cfg)
+    logger.info("Running projections for model=%s dataset=%s", model_name, dataset_name)
 
-
-    # get datasets
-    raw_test_dataset: RawGeoFMDataset = instantiate(cfg["dataset"], split="test")
-    test_dataset = GeoFMDataset(raw_test_dataset, test_preprocessor)
-
-    test_loader = DataLoader(
-        test_dataset,
-        # sampler=DistributedSampler(test_dataset),
-        num_workers=cfg["test_num_workers"],
-        pin_memory=True,
-        persistent_workers=False,
-        drop_last=False,
-        collate_fn=collate_fn,
-    )   
-
-    #TODO - end dataset/model initialiation - to change over to gfmtools style
-
-
-    encoder_name = cfg["encoder"]
-    embed_dir = os.path.join(cfg["embed_dir"], cfg["dataset"]["dataset_name"])
-    indices_root = ensure_dir(os.path.join(cfg["out_dir"], cfg["dataset"]["dataset_name"]))
-    out_dir = ensure_dir(os.path.join(indices_root, encoder_name))
-
-    n_runs = getattr(cfg, "n_runs", 3)
-    all_sil_rows = []
+    test_loader = build_test_loader(cfg)
+    all_sil_rows: List[Dict[str, Any]] = []
 
     for run_idx in range(n_runs):
-        embed_batches, target_batches = [], []
-        run_name = f"run_{run_idx}"
-        indices_subdir = ensure_dir(os.path.join(indices_root, run_name))
-        out_subdir = ensure_dir(os.path.join(out_dir, run_name))
+        embed_batches: List[np.ndarray] = []
+        target_batches: List[np.ndarray] = []
+
+        run_dir(cfg, run_idx, model_name=model_name)
+        dataset_run_dir(cfg, run_idx)
 
         for data in test_loader:
             if "filename" in data:
-                image, target, image_fname, meta = data["image"], data["target"], data["filename"], data["metadata"]
-                image_fname = image_fname[0]
+                image = data["image"]
+                target = data["target"]
+                image_fname = data["filename"][0]
             else:
-                image, target, meta = data["image"], data["target"], data["metadata"]
+                image = data["image"]
+                target = data["target"]
+                meta = data["metadata"]
                 image_fname = meta["image_filename"][0]
 
-            embed_fname = os.path.join(embed_dir, encoder_name, "test", "embd_" + os.path.splitext(image_fname)[0] + ".npy")
-            crop_info_fname = os.path.join(embed_dir, encoder_name, "test", "crop_info_" + os.path.splitext(image_fname)[0] + ".npy")
+            embed_fname = embedding_file_path(cfg, image_fname, model_name=model_name, split="test")
+            crop_fname = crop_info_file_path(cfg, image_fname, model_name=model_name, split="test")
+
             embed = np.load(embed_fname)
-            crop_info_all = np.load(crop_info_fname, allow_pickle=True).item() if os.path.exists(crop_info_fname) else None
+            crop_info_all = np.load(crop_fname, allow_pickle=True).item() if os.path.exists(crop_fname) else None
 
             crop_info = None
             img_size = None
-            for k, v in image.items():
-                crop_info = crop_info_all[k] if crop_info_all is not None else None
-                img_size = v[:, :, 0, :, :].shape[-1]
+            for key, value in image.items():
+                crop_info = crop_info_all[key] if crop_info_all is not None else None
+                img_size = value[:, :, 0, :, :].shape[-1]
 
-            embed, target_np = rescale_embed(embed, img_size, target, crop_info)
+            if img_size is None:
+                raise ValueError(f"Could not infer image size for {image_fname}")
+
+            embed_rescaled, target_np = rescale_embed(embed, img_size, target, crop_info)
             shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else (img_size, img_size)
-            indices = get_indices(cfg, image_fname, target_np, indices_subdir, shape_info)
+
+            indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
             if indices.size == 0:
                 continue
-            embed_batches.append(embed[indices, :].astype(np.float32, copy=False))
+
+            embed_batches.append(embed_rescaled[indices, :].astype(np.float32, copy=False))
             target_batches.append(target_np[indices].astype(np.int32, copy=False))
 
         if not embed_batches:
-            logger.warning("No embeddings selected for run %s", run_name)
+            logger.warning("No embeddings selected for run_%s", run_idx)
             continue
 
         embed_full = np.concatenate(embed_batches, axis=0)
         target_full = np.concatenate(target_batches, axis=0)
-        np.save(os.path.join(out_subdir, f"{encoder_name}.{cfg["dataset"]["dataset_name"]}.embed_subset.npy"), embed_full)
-        np.save(os.path.join(out_subdir, f"{encoder_name}.{cfg["dataset"]["dataset_name"]}.target_subset.npy"), target_full)
 
-        sil_rows = build_projection_artifacts(embed_full, target_full, out_subdir, cfg, cfg["dataset"]["dataset_name"], encoder_name)
+        np.save(embed_subset_path(cfg, run_idx, model_name=model_name), embed_full)
+        np.save(target_subset_path(cfg, run_idx, model_name=model_name), target_full)
+
+        sil_rows = build_projection_artifacts(cfg, run_idx, embed_full, target_full)
         all_sil_rows.extend(sil_rows)
+
+        manifest = build_run_manifest(
+            cfg=cfg,
+            run_idx=run_idx,
+            n_subset_samples=embed_full.shape[0],
+            embedding_dim=embed_full.shape[1],
+            projections=get_projections(cfg),
+            model_name=model_name,
+        )
+
+        by_projection = {
+            row["projection"]: {
+                "mean_sil": row["mean_sil"],
+                "std_sil": row["std_sil"],
+                "n_points": row["n_points"],
+                "projection_path": row["projection_path"],
+                "label_tif_path": row["label_tif_path"],
+                "knn_graph_path": row.get("knn_graph_path"),
+                "knn_k": row.get("knn_k"),
+                "knn_metric": row.get("knn_metric"),
+            }
+            for row in sil_rows
+        }
+        manifest["projection_stats"] = by_projection
+        save_json(manifest, run_manifest_path(cfg, run_idx, model_name=model_name))
 
     if all_sil_rows:
         pd.DataFrame(all_sil_rows).to_csv(
-            os.path.join(out_dir, f"silhouette_stats.{encoder_name}.{cfg["dataset"]["dataset_name"]}.csv"),
+            silhouette_stats_path(cfg, model_name=model_name),
             index=False,
         )
 
+    logger.info("Saved projection artifacts under %s", run_dir(cfg, 0, model_name=model_name).rsplit("/run_", 1)[0])
 
-if __name__ == "__main__":
 
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-y", "--yaml", help="YAML config file.")
+    parser.add_argument("-y", "--yaml", required=True, help="YAML config file.")
     args = parser.parse_args()
+
     cfg = read_yaml(args.yaml)
     run_knn_gen(cfg)
- 
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main()
 
 

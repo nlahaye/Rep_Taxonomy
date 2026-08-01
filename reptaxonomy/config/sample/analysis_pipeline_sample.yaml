@@ -1,0 +1,96 @@
+# full_pipeline_hlsburnscars_croma_dofa.yaml
+
+work_dir: ./work
+embed_dir: ./embeddings
+out_dir: ./outputs
+seed: 42
+n_runs: 3
+projections: [umap, tsne, pca]
+
+dataset:
+  name: hlsburnscars
+  dataset_name: hlsburnscars
+  split: test
+  task: segmentation
+  instrument: HLS
+  bands: [B2, B3, B4, B5, B6, B7]
+  target_name: burn_scar
+  bandset: hls_optical_6
+  modalities: [optical]
+  resolution: 30
+  num_classes: 1
+  ignore_index: 255
+  data_root: /mnt/data/rdemilt/hlsburnscars/
+
+dataset_init:
+  label_name: burn_scar
+  crs: EPSG:5070
+  additional_instruments: null
+
+model_names:
+  - croma_base
+  - dofa_base
+
+model_init:
+  pretrained: true
+  features_only: true
+  device: cuda
+
+per_model_overrides:
+  croma_base:
+    weights: null
+  dofa_base:
+    weights: ../checkpoints/dofa/
+    wavelengths:
+      S2:
+        B2: 0.49
+        B3: 0.56
+        B4: 0.665
+        B5: 0.705
+        B6: 0.74
+        B7: 0.783
+
+analysis: {}
+
+steps:
+  compute_resource_reqs:
+    enabled: true
+    config_overrides: {}
+
+  weight_matrix_analysis:
+    enabled: true
+    config_overrides: {}
+
+  run_projections:
+    enabled: true
+    config_overrides:
+      label_file_subset: 5000
+      build_knn: true
+      knn_metric: euclidean
+      umap_n_neighbors: 15
+      umap_min_dist: 0.1
+      umap_n_components: 2
+      umap_spread: 1.0
+      tsne_n_jobs: 8
+      pca_max_components: 64
+
+  embedding_robustness:
+    enabled: true
+    config_overrides:
+      id_methods: [MLE, TwoNN, TLE, DANCo, FisherS, MOM, CorrInt, ESS, MiND_ML, MiND_KL, MADA]
+      id_k_values: [5, 10, 20]
+      max_id_samples: 20000
+
+  data_kernel_analysis:
+    enabled: true
+    config_overrides: {}
+
+  geodesic_compare:
+    enabled: true
+    config_overrides:
+      representation: geo_euc
+
+  demsar_wrapper:
+    enabled: true
+    config_overrides:
+      alpha: 0.05

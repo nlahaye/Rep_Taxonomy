@@ -4,17 +4,26 @@ import argparse
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
 from reptaxonomy.util.general_utils import read_yaml
 
 from reptaxonomy.projections.run_projections import run_knn_gen
 from reptaxonomy.robustness.embedding_robustness import analyze_robustness
-from reptaxonomy.intercomapre.data_kernel_analysis import run_data_kernel_analysis
+from reptaxonomy.intercompare.data_kernel_analysis import run_data_kernel_analysis
 from reptaxonomy.intercompare.geodesic_compare import run_geodesic_compare
 from reptaxonomy.resources.compute_resource_reqs import compute_resource_reqs
 from reptaxonomy.robustness.weight_matrix_analysis import run_weight_mtx_analysis
 from reptaxonomy.summarize.demsar_wrapper import demsar_wrapper
+
+from reptaxonomy.experiment_init_utils import (
+    build_dataset_bundle,
+    build_dataset_spec,
+    build_model_bundle,
+    resolve_model_spec,
+    serialize_dataset_bundle,
+    serialize_model_bundle,
+)
 
 
 def ensure_dict(cfg: Any, name: str = "config") -> Dict[str, Any]:
@@ -33,10 +42,7 @@ def load_pipeline_config(path: str | Path) -> Dict[str, Any]:
 def load_model_names(model_names_cfg: Any) -> List[str]:
     if isinstance(model_names_cfg, list):
         model_names = model_names_cfg
-    elif isinstance(model_names_cfg, str):
-        with open(model_names_cfg, "r") as f:
-            model_names = json.load(f)
-    elif isinstance(model_names_cfg, Path):
+    elif isinstance(model_names_cfg, (str, Path)):
         with open(model_names_cfg, "r") as f:
             model_names = json.load(f)
     else:
@@ -58,44 +64,111 @@ def merge_dicts(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
-def with_model_cfg(base_cfg: Dict[str, Any], model_name: str) -> Dict[str, Any]:
-    cfg = copy.deepcopy(base_cfg)
-    cfg["encoder"] = model_name
-    return cfg
-
-
-def with_shared_runtime(base_cfg: Dict[str, Any], pipeline_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = copy.deepcopy(base_cfg)
-
-    for key in ["work_dir", "embed_dir", "out_dir", "n_runs", "seed", "projections"]:
-        if key in pipeline_cfg:
-            cfg[key] = copy.deepcopy(pipeline_cfg[key])
-
-    if "dataset" in pipeline_cfg:
-        cfg["dataset"] = copy.deepcopy(pipeline_cfg["dataset"])
-
-    return cfg
-
-
 def should_run(step_cfg: Dict[str, Any]) -> bool:
     return bool(step_cfg.get("enabled", True))
 
 
+def validate_pipeline_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = ensure_dict(cfg)
+
+    if "dataset" not in cfg:
+        raise ValueError("Missing required top-level config key: 'dataset'")
+    if "model_names" not in cfg:
+        raise ValueError("Missing required top-level config key: 'model_names'")
+
+    cfg["dataset"] = ensure_dict(cfg["dataset"], "dataset")
+    if "dataset_name" not in cfg["dataset"]:
+        if "name" in cfg["dataset"]:
+            cfg["dataset"]["dataset_name"] = cfg["dataset"]["name"]
+        else:
+            raise ValueError("dataset must define either 'dataset_name' or 'name'")
+
+    cfg["model_names"] = load_model_names(cfg["model_names"])
+    cfg["steps"] = ensure_dict(cfg.get("steps", {}), "steps")
+    cfg["per_model_overrides"] = ensure_dict(cfg.get("per_model_overrides", {}), "per_model_overrides")
+
+    cfg.setdefault("work_dir", "./work")
+    cfg.setdefault("embed_dir", "./embeddings")
+    cfg.setdefault("out_dir", "./outputs")
+    cfg.setdefault("n_runs", 3)
+    cfg.setdefault("seed", 42)
+    cfg.setdefault("projections", ["umap", "tsne", "pca"])
+    cfg.setdefault("dataset_init", {})
+    cfg.setdefault("model_init", {})
+    cfg.setdefault("analysis", {})
+
+    return cfg
+
+
+def attach_bundles_to_cfg(
+    cfg: Dict[str, Any],
+    dataset_bundle: DatasetBundle,
+    model_bundle: Optional[ModelBundle] = None,
+) -> Dict[str, Any]:
+    out = copy.deepcopy(cfg)
+
+    dataset_spec_dict = asdict(dataset_bundle.dataset_spec)
+    dataset_cls_name = dataset_bundle.dataset_cls.__name__
+    dataset_kwargs = copy.deepcopy(dataset_bundle.dataset_kwargs)
+    sample_schema = copy.deepcopy(dataset_bundle.sample_schema)
+    dataset_metadata = copy.deepcopy(dataset_bundle.metadata)
+
+    collate_fn_name = None
+    if getattr(dataset_bundle, "collate_fn", None) is not None:
+        collate_fn_name = getattr(dataset_bundle.collate_fn, "__name__", None)
+
+    out["dataset"] = copy.deepcopy(dataset_spec_dict)
+    out["dataset_bundle"] = {
+        "dataset_spec": dataset_spec_dict,
+        "dataset_cls_name": dataset_cls_name,
+        "dataset_kwargs": dataset_kwargs,
+        "sample_schema": sample_schema,
+        "metadata": dataset_metadata,
+        "collate_fn_name": collate_fn_name,
+    }
+
+    if model_bundle is not None:
+        model_spec_dict = asdict(model_bundle.model_spec)
+        model_dataset_spec_dict = asdict(model_bundle.dataset_spec)
+        model_cls_name = model_bundle.model_cls.__name__
+        model_kwargs = copy.deepcopy(model_bundle.model_kwargs)
+        model_metadata = copy.deepcopy(model_bundle.metadata)
+
+        out["model_bundle"] = {
+            "model_name": model_bundle.model_name,
+            "model_spec": model_spec_dict,
+            "dataset_spec": model_dataset_spec_dict,
+            "model_cls_name": model_cls_name,
+            "model_kwargs": model_kwargs,
+            "metadata": model_metadata,
+        }
+
+        out["encoder"] = model_bundle.model_name
+
+    return out
+
+
 def call_step(step_name: str, fn, cfg: Dict[str, Any]) -> None:
-    print(f"[PIPELINE] Running step: {step_name}")
+    dataset_name = cfg["dataset_bundle"]["dataset_spec"]["dataset_name"]
+    model_name = cfg.get("model_bundle", {}).get("model_name", "global")
+    print(f"[PIPELINE] Running step={step_name} dataset={dataset_name} model={model_name}")
     fn(cfg)
 
 
 def run_full_pipeline(cfg: Dict[str, Any]) -> None:
-    cfg = ensure_dict(cfg)
+    cfg = validate_pipeline_cfg(cfg)
 
-    model_names = load_model_names(cfg["model_names"])
-    projections = cfg.get("projections", ["umap", "tsne", "pca"])
-    cfg["model_names"] = model_names
-    cfg["projections"] = projections
+    dataset_spec = build_dataset_spec(
+        dataset_cfg=cfg["dataset"],
+        dataset_init=ensure_dict(cfg.get("dataset_init", {}), "dataset_init"),
+    )
+    dataset_bundle = build_dataset_bundle(dataset_spec)
 
-    steps = cfg.get("steps", {})
-    common_cfg = with_shared_runtime(cfg, cfg)
+    common_cfg = copy.deepcopy(cfg)
+    common_cfg["dataset"] = vars(dataset_spec)
+    common_cfg["model_names"] = cfg["model_names"]
+    common_cfg["projections"] = cfg["projections"]
+    common_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle)
 
     per_model_steps = [
         ("compute_resource_reqs", compute_resource_reqs),
@@ -110,36 +183,39 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
         ("demsar_wrapper", demsar_wrapper),
     ]
 
-    for model_name in model_names:
-        model_cfg = with_model_cfg(common_cfg, model_name)
+    shared_model_init = ensure_dict(cfg.get("model_init", {}), "model_init")
 
-        model_overrides = cfg.get("per_model_overrides", {}).get(model_name, {})
-        model_cfg = merge_dicts(model_cfg, model_overrides)
+    for model_name in cfg["model_names"]:
+        per_model_cfg = ensure_dict(
+            cfg.get("per_model_overrides", {}).get(model_name, {}),
+            f"per_model_overrides.{model_name}",
+        )
+        model_spec = resolve_model_spec(model_name, shared_model_init, per_model_cfg)
+        model_bundle = build_model_bundle(model_spec, dataset_bundle)
+
+        model_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle, model_bundle)
+        model_cfg["encoder"] = model_name
 
         for step_name, fn in per_model_steps:
-            step_cfg = ensure_dict(steps.get(step_name, {}), f"steps.{step_name}")
+            step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
             if not should_run(step_cfg):
                 continue
-
             final_cfg = merge_dicts(model_cfg, step_cfg.get("config_overrides", {}))
-            call_step(f"{step_name} [{model_name}]", fn, final_cfg)
+            call_step(step_name, fn, final_cfg)
 
     global_cfg = copy.deepcopy(common_cfg)
-    global_cfg["model_names"] = model_names
-    global_cfg["projections"] = projections
 
     for step_name, fn in global_steps:
-        step_cfg = ensure_dict(steps.get(step_name, {}), f"steps.{step_name}")
+        step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
         if not should_run(step_cfg):
             continue
-
         final_cfg = merge_dicts(global_cfg, step_cfg.get("config_overrides", {}))
         call_step(step_name, fn, final_cfg)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full pipeline from a YAML config.")
-    parser.add_argument("-y", "--yaml", required=True, help="Pipeline YAML config file.")
+    parser.add_argument("yaml", help="Pipeline YAML config file.")
     args = parser.parse_args()
 
     cfg = load_pipeline_config(args.yaml)
