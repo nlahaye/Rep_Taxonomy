@@ -609,8 +609,8 @@ def build_model_bundle(model_spec: ModelInitSpec, dataset_bundle: DatasetBundle)
             "weights": weights,
             "configuration": model_spec.variant,  # e.g. "eo_v2_300m_tl"
             "encoder_only": encoder_only,
-            "embed_dim": model_spec.extra.get("encoder_dim", 768)
-            "depth": model_spec.extra.get("encoder_depth", 12)
+            "embed_dim": model_spec.extra.get("encoder_dim", 768),
+            "depth": model_spec.extra.get("encoder_depth", 12),
             "num_heads": model_spec.extra.get("num_heads", 12),
             "patch_size": model_spec.extra.get("patch_size", (1,16,16)),
             "image_size": model_spec.extra.get("image_size", 224),
