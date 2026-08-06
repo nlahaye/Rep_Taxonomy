@@ -14,6 +14,11 @@ from gfmtools.models.resnet import ResNetEncoder
 from gfmtools.models.swin import SwinEncoder
 from gfmtools.models.dofa import DofaEncoder
 from gfmtools.models.unet import unet
+from gfmtools.models.prithvi import (
+    PrithviEncoder,
+    PrithviEO1_Weights,
+    PrithviEO2_Weights,
+)
 
 
 from __future__ import annotations
@@ -274,6 +279,14 @@ MODEL_ALIASES: dict[str, dict[str, Any]] = {
     "croma_base": {"family": "croma", "variant": "base"},
     "croma_large": {"family": "croma", "variant": "large"},
     "unet": {"family": "unet", "variant": None},
+
+    # Prithvi-EO encoders
+    "prithvi_eo_v1_100m": {"family": "prithvi", "variant": "eo_v1_100m"},
+    "prithvi_eo_v2_100m_tl": {"family": "prithvi", "variant": "eo_v2_100m_tl"},
+    "prithvi_eo_v2_300m": {"family": "prithvi", "variant": "eo_v2_300m"},
+    "prithvi_eo_v2_300m_tl": {"family": "prithvi", "variant": "eo_v2_300m_tl"},
+    "prithvi_eo_v2_600m": {"family": "prithvi", "variant": "eo_v2_600m"},
+    "prithvi_eo_v2_600m_tl": {"family": "prithvi", "variant": "eo_v2_600m_tl"},
 }
 
 
@@ -284,6 +297,7 @@ MODEL_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "DofaEncoder": DofaEncoder,
     "CROMAEncoder": CROMAEncoder,
     "unet": unet,
+    "PrithviEncoder": PrithviEncoder,
 }
 
 
@@ -578,6 +592,53 @@ def build_model_bundle(model_spec: ModelInitSpec, dataset_bundle: DatasetBundle)
             "expected_bands": ds.bands,
             "modalities": modalities,
             "configuration": model_kwargs["configuration"],
+        }
+
+
+    elif model_spec.family == "prithvi":
+        # Choose weight enum based on variant if user passed a string alias.
+        # If model_spec.weights is already a WeightsEnum or a path, we pass it through.
+        weights = model_spec.weights
+
+        # Optionally map simple string shortcuts to concrete enum members.
+        if isinstance(weights, str):
+            weights_lc = weights.lower()
+            if "eo-1.0" in weights_lc or "100m" in weights_lc and "v1" in weights_lc:
+                weights = PrithviEO1_Weights.EO_1_0_100M
+            elif "2.0" in weights_lc and "100m" in weights_lc:
+                weights = PrithviEO2_Weights.EO_2_0_100M_TL
+            elif "2.0" in weights_lc and "300m" in weights_lc and "tl" in weights_lc:
+                weights = PrithviEO2_Weights.EO_2_0_300M_TL
+            elif "2.0" in weights_lc and "300m" in weights_lc:
+                weights = PrithviEO2_Weights.EO_2_0_300M
+            elif "2.0" in weights_lc and "600m" in weights_lc and "tl" in weights_lc:
+                weights = PrithviEO2_Weights.EO_2_0_600M_TL
+            elif "2.0" in weights_lc and "600m" in weights_lc:
+                weights = PrithviEO2_Weights.EO_2_0_600M
+            # else: leave as string (local path) and let PrithviEncoder load it.
+
+        # Set encoder_only / features_only link:
+        encoder_only = model_spec.features_only
+
+        model_cls = PrithviEncoder
+        model_kwargs = {
+            "weights": weights,
+            "configuration": model_spec.variant,  # e.g. "eo_v2_300m_tl"
+            "encoder_only": encoder_only,
+            "embed_dim": model_spec.extra.get("encoder_dim", 768)
+            "depth": model_spec.extra.get("encoder_depth", 12)
+            "num_heads": model_spec.extra.get("num_heads", 12),
+            "patch_size": model_spec.extra.get("patch_size", (1,16,16)),
+            "image_size": model_spec.extra.get("image_size", 224),
+
+            # allow extra to override default arguments if needed:
+            **model_spec.extra,
+        }
+
+        metadata = {
+            "expected_instrument": ds.instrument,
+            "expected_bands": ds.bands,
+            "coords_encoding": model_kwargs.get("coords_encoding"),
         }
 
     else:
