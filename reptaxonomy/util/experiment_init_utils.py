@@ -536,6 +536,7 @@ def build_model_bundle(model_spec: ModelInitSpec, dataset_bundle: DatasetBundle)
             "weights": model_spec.weights or "\.\./checkpoints/dofa/",
             "configuration": model_spec.variant or "base",
             "wavelengths": wavelengths,
+            "image_size": model_spec.extra.get("image_size", 224),
         }
         metadata = {
             "expected_instrument": ds.instrument,
