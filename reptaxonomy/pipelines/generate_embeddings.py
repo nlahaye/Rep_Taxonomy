@@ -238,26 +238,40 @@ def move_image_to_device(image: Any, device: str) -> Any:
 
 
 def select_encoder_output(feat: Any) -> torch.Tensor:
+    if isinstance(feat, dict):
+        for key in feat.keys():
+            if "encodings" in key: #TODO - generalize and allow for multiple modalities
+                feat = feat[key]
+                break
+
     if isinstance(feat, (list, tuple)):
         feat = feat[-1]
+
     if not torch.is_tensor(feat):
         raise TypeError(f"Unsupported model output type: {type(feat)}")
+
     if feat.ndim > 0 and feat.shape[0] == 1:
         feat = feat[0]
     return feat
 
 
-def run_model_forward(model: Any, image: Any, dataset_instance: Any) -> np.ndarray:
+def run_model_forward(model: Any, image: Any, dataset_instance: Any, device: str) -> np.ndarray:
     with torch.no_grad():
         if getattr(model, "multi_temporal", False):
-            feat = model.forward_instruments(image)
+            if getattr(model, "wavelengths", False):
+                feat = model.forward_instruments(image, device=device, permissive=True)
+            else:
+                feat = model.forward_instruments(image, device=device)
             if getattr(model, "multi_temporal_output", False) and isinstance(feat, (list, tuple)):
                 feat = [f.squeeze(-3) if torch.is_tensor(f) and f.ndim >= 3 else f for f in feat]
             feat = select_encoder_output(feat)
             return feat.detach().cpu().numpy()
 
         else:
-            feat = model.forward_instruments(image)
+            if getattr(model, "wavelengths", False):
+                feat = model.forward_instruments(image, device=device, permissive=True)
+            else:
+                feat = model.forward_instruments(image, device=device)
 
         feat = select_encoder_output(feat)
         return feat.detach().cpu().numpy()
@@ -365,7 +379,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
         print(f"[EMBED] dataset={dataset_name} model={model_name} split={model_cfg['split']} out={out_dir}")
 
         model = build_model_instance(model_bundle, device=device)
-
+        model = model.to(device)
 
         success_count = 0
         fail_count = 0
@@ -397,7 +411,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
             try:
                 #image = move_image_to_device(batch["image"], device)
                 crop_info = get_crop_info(batch)
-                feat_np = run_model_forward(model, batch, dataset_instance)
+                feat_np = run_model_forward(model, batch, dataset_instance, device)
 
                 emb_path, crop_path = save_embedding_artifacts(
                     out_dir=out_dir,
