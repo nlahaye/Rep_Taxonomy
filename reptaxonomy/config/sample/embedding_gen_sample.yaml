@@ -1,8 +1,8 @@
 # embed_hlsburnscars_croma_dofa.yaml
 
-work_dir: ./work
-embed_dir: ./embeddings
-out_dir: ./outputs
+work_dir: /data/nlahaye/rep_taxonomy//work
+embed_dir: /data/nlahaye/rep_taxonomy//embeddings
+out_dir: /data/nlahaye/rep_taxonomy//outputs
 seed: 42
 
 dataset:
@@ -18,7 +18,7 @@ dataset:
   resolution: 30
   num_classes: 1
   ignore_index: 255
-  data_root: /mnt/data/rdemilt/hlsburnscars/
+  data_root: /data/nlahaye/rep_taxonomy/data/hlsburnscars/
 
 dataset_init:
   label_name: burn_scar
@@ -26,7 +26,7 @@ dataset_init:
   additional_instruments: null
 
 model_names:
-  - croma_base
+  - croma_large
   - dofa_base
 
 model_init:
@@ -35,10 +35,17 @@ model_init:
   device: cuda
 
 per_model_overrides:
-  croma_base:
-    weights: null
+  croma_large:
+    weights: /data/nlahaye/rep_taxonomy/checkpoints/croma/CROMA_large.pt
+    modalities: [optical]
+    image_size: 120
+    patch_size: 8
+    encoder_dim: 768
+    encoder_depth: 12
+    num_heads: 16
+    variant: large
   dofa_base:
-    weights: ../checkpoints/dofa/
+    weights: /data/nlahaye/rep_taxonomy/checkpoints/dofa/DOFA_ViT_base_e100.pth
     wavelengths:
       S2:
         B2: 0.49

@@ -15,26 +15,15 @@ import numpy as np
 import torch
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.experiment_init_utils import (
+from reptaxonomy.util.experiment_init_utils import (
     build_dataset_bundle,
     build_dataset_spec,
     build_model_bundle,
     resolve_model_spec,
     build_test_loader
 )
+from reptaxonomy.util.artifacts import ensure_dict
 
-try:
-    from pangaea.utils.collate_fn import get_collate_fn
-except Exception:
-    get_collate_fn = None
-
-
-def ensure_dict(cfg: Any, name: str = "config") -> Dict[str, Any]:
-    if cfg is None:
-        raise ValueError(f"{name} is empty or unreadable")
-    if not isinstance(cfg, dict):
-        raise ValueError(f"{name} must be a dictionary")
-    return cfg
 
 
 def load_pipeline_config(path: str | Path) -> Dict[str, Any]:
@@ -261,41 +250,14 @@ def select_encoder_output(feat: Any) -> torch.Tensor:
 def run_model_forward(model: Any, image: Any, dataset_instance: Any) -> np.ndarray:
     with torch.no_grad():
         if getattr(model, "multi_temporal", False):
-            feat = model(image)
+            feat = model.forward_instruments(image)
             if getattr(model, "multi_temporal_output", False) and isinstance(feat, (list, tuple)):
                 feat = [f.squeeze(-3) if torch.is_tensor(f) and f.ndim >= 3 else f for f in feat]
             feat = select_encoder_output(feat)
             return feat.detach().cpu().numpy()
 
-        if getattr(dataset_instance, "multi_temporal", False) and isinstance(image, dict):
-            n_t = None
-            for _, v in image.items():
-                if torch.is_tensor(v) and v.ndim >= 5:
-                    n_t = v.shape[2]
-                    break
-            if n_t is not None:
-                feats = []
-                for i in range(n_t):
-                    sliced = {
-                        k: (v[:, :, i, :, :] if torch.is_tensor(v) and v.ndim >= 5 else v)
-                        for k, v in image.items()
-                    }
-                    out_i = model(sliced)
-                    if isinstance(out_i, (list, tuple)):
-                        out_i = torch.stack([x for x in out_i if torch.is_tensor(x)], dim=0)
-                    feats.append(out_i)
-                feat = torch.stack(feats, dim=2)
-                feat = select_encoder_output(feat)
-                return feat.detach().cpu().numpy()
-
-        if isinstance(image, dict):
-            squeezed = {
-                k: (v[:, :, 0, :, :] if torch.is_tensor(v) and v.ndim >= 5 else v)
-                for k, v in image.items()
-            }
-            feat = model(squeezed)
         else:
-            feat = model(image)
+            feat = model.forward_instruments(image)
 
         feat = select_encoder_output(feat)
         return feat.detach().cpu().numpy()
@@ -408,7 +370,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
         success_count = 0
         fail_count = 0
 
-        loader = build_test_loader(cfg)
+        loader = build_test_loader(model_cfg)
 
         for batch_idx, batch in enumerate(loader):
             image_fname = get_image_fname(batch, batch_idx)
@@ -433,9 +395,9 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
                 continue
 
             try:
-                image = move_image_to_device(batch["image"], device)
+                #image = move_image_to_device(batch["image"], device)
                 crop_info = get_crop_info(batch)
-                feat_np = run_model_forward(model, image, dataset_instance)
+                feat_np = run_model_forward(model, batch, dataset_instance)
 
                 emb_path, crop_path = save_embedding_artifacts(
                     out_dir=out_dir,
@@ -492,7 +454,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bundle-aware standalone embedding export pipeline.")
-    parser.add_argument("yaml", help="Pipeline YAML config file.")
+    parser.add_argument("-y", "--yaml", help="Pipeline YAML config file.")
     args = parser.parse_args()
 
     cfg = load_pipeline_config(args.yaml)

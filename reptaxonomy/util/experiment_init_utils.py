@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, Optional, Type, List, Mapping, Sequence
 
 from torchvision.models._api import WeightsEnum
 
@@ -13,6 +13,7 @@ from gfmtools.data.datasets.landfire import LandfireDataset
 from gfmtools.models.resnet import ResNetEncoder
 from gfmtools.models.swin import SwinEncoder
 from gfmtools.models.dofa import DofaEncoder
+from gfmtools.models.croma import CROMAEncoder
 from gfmtools.models.unet import unet
 from gfmtools.models.prithvi import (
     PrithviEncoder,
@@ -20,8 +21,7 @@ from gfmtools.models.prithvi import (
     PrithviEO2_Weights,
 )
 
-
-from __future__ import annotations
+from reptaxonomy.util.artifacts import ensure_dict
 
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -29,75 +29,59 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
-from gfmtools.data.datasets.epa import EPALabels
-from gfmtools.data.datasets.hlsburnscars import HLSBurnScars
-from gfmtools.data.datasets.landfire import LandfireDataset
 
 
+def _safe_default_collate(values: List[Any]) -> Any:
+    try:
+        return default_collate(values)
+    except Exception:
+        return values
 
-DATASET_REGISTRY = {
-    "EPALabels": EPALabels,
-    "HLSBurnScars": HLSBurnScars,
-    "LandfireDataset": LandfireDataset,
-}
+
+def _recursive_collate(values: List[Any]) -> Any:
+    if not values:
+        return values
+
+    first = values[0]
+
+    if isinstance(first, Mapping):
+        out: Dict[str, Any] = {}
+        keys = first.keys()
+        for key in keys:
+            key_values = [v[key] for v in values]
+            out[key] = _recursive_collate(key_values)
+        return out
+
+    return _safe_default_collate(values)
 
 
-def _build_collate_fn(sample_schema: Dict[str, Any]):
-    image_key = str(sample_schema.get("image_key", "image"))
-    target_key = str(sample_schema.get("target_key", "target"))
-    metadata_key = str(sample_schema.get("metadata_key", "metadata"))
-    filename_key = str(sample_schema.get("filename_key", "filename"))
+def build_forward_instruments_collate_fn(sample_schema: Dict[str, Any] | None = None):
+    sample_schema = sample_schema or {}
+    passthrough_keys = set(sample_schema.get("passthrough_keys", []))
 
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not batch:
             return {}
 
+        first = batch[0]
         out: Dict[str, Any] = {}
 
-        if image_key in batch[0]:
-            first_image = batch[0][image_key]
-            if isinstance(first_image, Mapping):
-                image_dict: Dict[str, Any] = {}
-                for k in first_image.keys():
-                    image_dict[k] = default_collate([sample[image_key][k] for sample in batch])
-                out["image"] = image_dict
-            else:
-                out["image"] = default_collate([sample[image_key] for sample in batch])
+        for key in first.keys():
+            values = [sample[key] for sample in batch]
 
-        if target_key in batch[0]:
-            out["target"] = default_collate([sample[target_key] for sample in batch])
-
-        if filename_key in batch[0]:
-            out["filename"] = [sample[filename_key] for sample in batch]
-
-        if metadata_key in batch[0]:
-            metadata_batch = [sample[metadata_key] for sample in batch]
-            if metadata_batch and isinstance(metadata_batch[0], Mapping):
-                merged_meta: Dict[str, Any] = {}
-                for k in metadata_batch[0].keys():
-                    values = [m[k] for m in metadata_batch]
-                    try:
-                        merged_meta[k] = default_collate(values)
-                    except Exception:
-                        merged_meta[k] = values
-                out["metadata"] = merged_meta
-            else:
-                out["metadata"] = metadata_batch
-
-        for key in batch[0].keys():
-            if key in {image_key, target_key, metadata_key, filename_key}:
+            if key in passthrough_keys:
+                out[key] = values
                 continue
-            try:
-                out[key] = default_collate([sample[key] for sample in batch])
-            except Exception:
-                out[key] = [sample[key] for sample in batch]
+
+            out[key] = _recursive_collate(values)
 
         return out
 
     return collate_fn
 
-
 def build_test_loader(cfg: Dict[str, Any]) -> DataLoader:
+    print(cfg.keys)
+    print("dataset_bundle" in cfg)
     cfg = ensure_dict(cfg, "run_projections cfg")
     bundle_cfg = cfg.get("dataset_bundle")
     if not isinstance(bundle_cfg, dict):
@@ -123,11 +107,6 @@ def build_test_loader(cfg: Dict[str, Any]) -> DataLoader:
     split_key = sample_schema.get("split_arg_name", "split")
     dataset_init_kwargs[split_key] = sample_schema.get("test_split_value", "test")
 
-    if "dataset_name" in dataset_spec and "dataset_name" not in dataset_init_kwargs:
-        dataset_init_kwargs["dataset_name"] = dataset_spec["dataset_name"]
-
-    if "root" in cfg and "root" not in dataset_init_kwargs:
-        dataset_init_kwargs["root"] = cfg["root"]
     if "data_root" in cfg and "data_root" not in dataset_init_kwargs:
         dataset_init_kwargs["data_root"] = cfg["data_root"]
 
@@ -139,7 +118,7 @@ def build_test_loader(cfg: Dict[str, Any]) -> DataLoader:
     persistent_workers = bool(cfg.get("persistent_workers", num_workers > 0))
     drop_last = bool(cfg.get("drop_last", False))
 
-    collate_fn = _build_collate_fn(sample_schema)
+    collate_fn = collate_fn = build_forward_instruments_collate_fn(sample_schema) 
 
     return DataLoader(
         dataset,
@@ -259,7 +238,11 @@ DATASET_PRESETS: Dict[str, DatasetSpec] = {
 }
 
 
-
+DATASET_REGISTRY = {
+    "EPALabels": EPALabels,
+    "HLSBurnScars": HLSBurnScars,
+    "LandfireDataset": LandfireDataset,
+}
 
 DATASET_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "EPALabels": EPALabels,
@@ -332,13 +315,13 @@ def build_dataset_spec(dataset_cfg: Dict[str, Any], dataset_init: Dict[str, Any]
         multi_image=merged.get("multi_image", merged.get("multiimage")),
         modalities=merged.get("modalities"),
         resolution=merged.get("resolution"),
-        data_root=merged.get("data_root", merged.get("dataroot")),
+        data_root=merged.get("data_root", merged.get("data_root")),
         init=merged.get("init", {}),
         extra={k: v for k, v in merged.items() if k not in {
             "name", "dataset_name", "split", "task", "instrument", "bands", "target_name",
             "targetname", "num_classes", "numclasses", "ignore_index", "ignoreindex",
             "bandset", "multi_image", "multiimage", "modalities", "resolution",
-            "data_root", "dataroot", "init"
+            "data_root", "data_root", "init"
         }},
     )
 
@@ -378,7 +361,7 @@ def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
 
     if dataset_name == "hlsburnscars":
         dataset_kwargs = {
-            "dataroot": spec.data_root or "/mnt/data/rdemilth/hlsburnscars",
+            "data_root": spec.data_root or "/mnt/data/rdemilth/hlsburnscars",
             "label_name": init.get("label_name", "burnscar"),
             "split": init.get("split", spec.split or "test"),
             "crs": init.get("crs", "EPSG:5070"),
@@ -403,7 +386,7 @@ def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
 
     if dataset_name == "epa":
         dataset_kwargs = {
-            "dataroot": spec.data_root or "/mnt/data/mtruong",
+            "data_root": spec.data_root or "/mnt/data/mtruong",
             "split": init.get("split", spec.split or "test"),
             "split_file": init.get("split_file", "/home/rdemilt/sparkbenchmark/epa_splits.yml"),
             "regions": init.get("regions", None),
@@ -435,7 +418,7 @@ def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
 
     if dataset_name == "landfire":
         dataset_kwargs = {
-            "dataroot": spec.data_root or "/mnt/data/rdemilt/fbfm40",
+            "data_root": spec.data_root or "/mnt/data/rdemilt/fbfm40",
             "targets": init.get("targets", "fbfm40"),
             "crs": init.get("crs", "EPSG:5070"),
             "instruments": init.get("instruments", "HLS"),
