@@ -26,6 +26,7 @@ dataset_init:
   additional_instruments: null
 
 model_names:
+  - prithvi_eo_v1_100m
   - croma_large
   - dofa_base
 
@@ -35,10 +36,13 @@ model_init:
   device: cuda
 
 per_model_overrides:
+  prithvi_eo_v1_100m:
+    weights: /data/nlahaye/output/Pangaea/model/Prithvi_100M.pt
+    image_size: 512
   croma_large:
     weights: /data/nlahaye/rep_taxonomy/checkpoints/croma/CROMA_large.pt
     modalities: [optical]
-    image_size: 120
+    image_size: 512
     patch_size: 8
     encoder_dim: 768
     encoder_depth: 12
@@ -46,8 +50,9 @@ per_model_overrides:
     variant: large
   dofa_base:
     weights: /data/nlahaye/rep_taxonomy/checkpoints/dofa/DOFA_ViT_base_e100.pth
+    image_size: 512
     wavelengths:
-      S2:
+      HLS:
         B2: 0.49
         B3: 0.56
         B4: 0.665
