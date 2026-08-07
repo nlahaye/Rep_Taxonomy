@@ -19,7 +19,7 @@ from calflops import calculate_flops
 from codecarbon import EmissionsTracker
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.experiment_init_utils import MODEL_CLASS_REGISTRY, DATASET_CLASS_REGISTRY
+from reptaxonomy.experiment_init_utils import build_test_dataset_from_bundle, build_model_from_bundle
 
 
 def ensure_dir(path: str) -> str:
@@ -43,30 +43,6 @@ def get_model_name(cfg: Dict[str, Any]) -> str:
         return cfg["encoder"]
     raise ValueError("Could not resolve model name from config")
 
-
-def build_model_from_bundle(cfg: Dict[str, Any], device: str):
-    bundle = cfg["model_bundle"]
-    cls_name = bundle["model_cls_name"]
-    if cls_name not in MODEL_CLASS_REGISTRY:
-        raise ValueError(f"Unknown model class in bundle: {cls_name}")
-    model_cls = MODEL_CLASS_REGISTRY[cls_name]
-    model_kwargs = dict(bundle.get("model_kwargs", {}))
-    model = model_cls(**model_kwargs)
-    if hasattr(model, "load_encoder_weights"):
-        model.load_encoder_weights(logging.getLogger(__name__))
-    model.to(device)
-    model.eval()
-    return model
-
-
-def build_test_dataset_from_bundle(cfg: Dict[str, Any]):
-    bundle = cfg["dataset_bundle"]
-    cls_name = bundle["dataset_cls_name"]
-    if cls_name not in DATASET_CLASS_REGISTRY:
-        raise ValueError(f"Unknown dataset class in bundle: {cls_name}")
-    dataset_cls = DATASET_CLASS_REGISTRY[cls_name]
-    dataset_kwargs = dict(bundle.get("dataset_kwargs", {}))
-    return dataset_cls(**dataset_kwargs)
 
 
 def normalize_image_dict(image: Any) -> Dict[str, torch.Tensor]:

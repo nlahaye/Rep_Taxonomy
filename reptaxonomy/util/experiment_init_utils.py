@@ -729,3 +729,33 @@ def initialize_experiment(
     model_spec = resolve_model_spec(model_name, shared_model_init, per_model_cfg)
     model_bundle = build_model_bundle(model_spec, dataset_bundle)
     return ExperimentBundle(dataset_bundle=dataset_bundle, model_bundle=model_bundle)
+
+
+def build_model_from_bundle(cfg: Dict[str, Any], device: str = None):
+    bundle = cfg["model_bundle"]
+    cls_name = bundle["model_cls_name"]
+    if cls_name not in MODEL_CLASS_REGISTRY:
+        raise ValueError(f"Unknown model class in bundle: {cls_name}")
+    model_cls = MODEL_CLASS_REGISTRY[cls_name]
+    model_kwargs = dict(bundle.get("model_kwargs", {}))
+    model = model_cls(**model_kwargs)
+    if hasattr(model, "load_encoder_weights"):
+        model.load_encoder_weights(logging.getLogger(__name__))
+    if device is not None:
+        model.to(device)
+    model.eval()
+    return model
+
+
+
+def build_test_dataset_from_bundle(cfg: Dict[str, Any]):
+    bundle = cfg["dataset_bundle"]
+    cls_name = bundle["dataset_cls_name"]
+    if cls_name not in DATASET_CLASS_REGISTRY:
+        raise ValueError(f"Unknown dataset class in bundle: {cls_name}")
+    dataset_cls = DATASET_CLASS_REGISTRY[cls_name]
+    dataset_kwargs = dict(bundle.get("dataset_kwargs", {}))
+    return dataset_cls(**dataset_kwargs)
+
+
+

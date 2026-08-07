@@ -15,19 +15,8 @@ import pandas as pd
 import weightwatcher as ww
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.experiment_init_utils import (
-    ResNetEncoder,
-    SwinEncoder,
-    DofaEncoder,
-    unet,
-)
+from reptaxonomy.experiment_init_utils import build_model_from_bundle
 
-MODEL_CLASS_REGISTRY = {
-    "ResNetEncoder": ResNetEncoder,
-    "SwinEncoder": SwinEncoder,
-    "DofaEncoder": DofaEncoder,
-    "unet": unet,
-}
 
 def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
@@ -54,16 +43,6 @@ def get_model_name(cfg: Dict[str, Any]) -> str:
         return cfg["model_bundle"]["model_name"]
     return cfg["encoder"]
 
-def build_model_from_bundle(cfg: Dict[str, Any]):
-    bundle = cfg["model_bundle"]
-    cls_name = bundle["model_cls_name"]
-    model_cls = MODEL_CLASS_REGISTRY[cls_name]
-    model_kwargs = dict(bundle.get("model_kwargs", {}))
-    model = model_cls(**model_kwargs)
-    if hasattr(model, "load_encoder_weights"):
-        model.load_encoder_weights(logging.getLogger(__name__))
-    model.eval()
-    return model
 
 def get_colors(n):
     return ["#%06X" % randint(0, 0xFFFFFF) for _ in range(n)]
