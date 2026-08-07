@@ -69,3 +69,81 @@ overwrite: false
 fail_fast: false
 write_manifest: true
 device: cuda
+
+seed: 42
+n_runs: 3
+projections: [umap, tsne, pca]
+
+test_batch_size: 1
+test_num_workers: 4
+pin_memory: true
+persistent_workers: true
+drop_last: false
+
+
+# Pipeline execution controls.
+#
+# Per-model steps run separately for each model.
+# Global steps run after all per-model steps have completed.
+steps:
+  compute_resource_reqs:
+    enabled: true
+    config_overrides:
+      device: cuda
+
+  weight_matrix_analysis:
+    enabled: true
+    config_overrides:
+      # Add model-analysis-specific options here if that module requires them.
+      seed: 42
+
+  run_projections:
+    enabled: true
+    config_overrides:
+      # Embedding/projection generation settings.
+      test_batch_size: 1
+      test_num_workers: 4
+      batch_size: 1
+      num_workers: 4
+      device: cuda
+      n_runs: 3
+      seed: 42
+      projections: [umap, tsne, pca]
+      save_crop_info: true
+      overwrite: false
+      fail_fast: false
+      write_manifest: true
+
+  embedding_robustness:
+    enabled: true
+    config_overrides:
+      n_runs: 3
+      seed: 42
+
+      # Intrinsic-dimension estimators used on each embedding output.
+      id_methods: [MLE, TwoNN, TLE, DANCo, FisherS, MOM, CorrInt, ESS, MiNDML, MiNDKL, MADA]
+      id_k_values: [5, 10, 20]
+      max_id_samples: 20000
+
+  data_kernel_analysis:
+    enabled: true
+    config_overrides:
+      n_runs: 3
+      seed: 42
+      projections: [umap, tsne, pca]
+
+  geodesic_compare:
+    enabled: true
+    config_overrides:
+      n_runs: 3
+      seed: 42
+      projections: [umap, tsne, pca]
+
+  demsar_wrapper:
+    enabled: true
+    config_overrides:
+      alpha: 0.05
+
+analysis:
+  alpha: 0.05
+
