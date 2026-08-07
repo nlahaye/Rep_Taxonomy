@@ -17,7 +17,7 @@ from graspologic.embed import AdjacencySpectralEmbed, ClassicalMDS, OmnibusEmbed
 from graspologic.simulations import rdpg
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.artifacts import (
+from reptaxonomy.util.artifacts import (
     ensure_dict,
     get_dataset_name,
     get_model_names,
