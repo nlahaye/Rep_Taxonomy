@@ -15,7 +15,7 @@ import pandas as pd
 import weightwatcher as ww
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.experiment_init_utils import (
+from reptaxonomy.util.experiment_init_utils import (
     ResNetEncoder,
     SwinEncoder,
     DofaEncoder,

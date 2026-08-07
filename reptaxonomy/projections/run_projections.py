@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from reptaxonomy.util.general_utils import read_yaml
 from reptaxonomy.util.experiment_init_utils import build_test_loader
-from reptaxonomy.artifacts import (
+from reptaxonomy.util.artifacts import (
     ensure_dict,
     get_dataset_name,
     get_model_name,
