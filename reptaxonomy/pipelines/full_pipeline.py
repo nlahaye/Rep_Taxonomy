@@ -215,7 +215,7 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
         model_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle, model_bundle)
         model_cfg["encoder"] = model_name
 
-        for step_name, fn in per_model_steps:
+        for step_name, fn, _ in per_model_steps:
             step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
             if not should_run(step_cfg):
                 continue
