@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Callable, Dict, Optional, Type, List, Mapping, Sequence
 
@@ -739,8 +741,6 @@ def build_model_from_bundle(cfg: Dict[str, Any], device: str = None):
     model_cls = MODEL_CLASS_REGISTRY[cls_name]
     model_kwargs = dict(bundle.get("model_kwargs", {}))
     model = model_cls(**model_kwargs)
-    if hasattr(model, "load_encoder_weights"):
-        model.load_encoder_weights(logging.getLogger(__name__))
     if device is not None:
         model.to(device)
     model.eval()

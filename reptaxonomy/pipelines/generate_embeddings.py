@@ -182,12 +182,6 @@ def build_model_instance(model_bundle: Any, device: str) -> Any:
             raise ValueError("Model bundle does not expose model_cls or a prebuilt model instance")
         model = model_cls(**model_kwargs)
 
-    if hasattr(model, "load_encoder_weights"):
-        try:
-            model.load_encoder_weights(None)
-        except TypeError:
-            model.load_encoder_weights()
-
     model = model.to(device)
     model.eval()
     return model

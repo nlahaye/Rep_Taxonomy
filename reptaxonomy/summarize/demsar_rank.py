@@ -379,7 +379,6 @@ def build_meta_ranking(metric_summaries: List[Dict], output_dir: Path) -> pd.Dat
     return out
 
 
-from typing import Any
 
 def _coerce_path(value: Any, field_name: str) -> Path:
     if value is None:
@@ -394,7 +393,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         raise ValueError("Top-level YAML config must parse to a mapping/dictionary")
     return cfg
 
-def main(cfg)
+def run_demsar(cfg):
  
     root_dir = _coerce_path(cfg.get("root_dir"), "root_dir")
     output_dir = Path(cfg.get("output_dir", "output/demsar_analysis"))

@@ -8,8 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from reptaxonomy.util.general_utils import read_yaml, resolve_dataset_name, resolve_model_name
-from demsar_rank import run_demsar
+from reptaxonomy.util.general_utils import read_yaml, resolve_dataset_name, resolve_model_names
+from reptaxonomy.summarize.demsar_rank import run_demsar
 
 
 def load_json(path: Path) -> Any:

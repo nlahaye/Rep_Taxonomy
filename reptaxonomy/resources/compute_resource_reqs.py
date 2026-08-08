@@ -19,7 +19,7 @@ from calflops import calculate_flops
 from codecarbon import EmissionsTracker
 
 from reptaxonomy.util.general_utils import read_yaml
-from reptaxonomy.experiment_init_utils import build_test_dataset_from_bundle, build_model_from_bundle
+from reptaxonomy.util.experiment_init_utils import build_test_dataset_from_bundle, build_model_from_bundle
 
 
 def ensure_dir(path: str) -> str:
