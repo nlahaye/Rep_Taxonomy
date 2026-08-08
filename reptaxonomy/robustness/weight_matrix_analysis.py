@@ -94,7 +94,11 @@ def run_weight_mtx_analysis(cfg: Dict[str, Any]):
         savefig=False,
         layers=analysis_cfg.get("ww_layers", []),
     )
+
     summaries = watcher.get_summary(details)
+ 
+    summaries = pd.DataFrame([summaries])
+    details = pd.DataFrame(details)
 
     prefix = model_name
     dataframe_to_pickle(details, os.path.join(stats_dir, f"{prefix}.details.pkl"))
