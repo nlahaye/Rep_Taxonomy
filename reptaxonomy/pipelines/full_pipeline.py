@@ -174,10 +174,26 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
     common_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle)
 
     per_model_steps = [
-        ("compute_resource_reqs", compute_resource_reqs),
-        ("weight_matrix_analysis", run_weight_mtx_analysis),
-        ("run_projections", run_knn_gen),
-        ("embedding_robustness", analyze_robustness),
+        (
+            "compute_resource_reqs",
+            compute_resource_reqs,
+            "supports_resource_requirements",
+        ),
+        (
+            "weight_matrix_analysis",
+            run_weight_mtx_analysis,
+            "supports_weight_matrix_analysis",
+        ),
+        (
+            "run_projections",
+            run_knn_gen,
+            "supports_projection_analysis",
+        ),
+        (
+            "embedding_robustness",
+            analyze_robustness,
+            "supports_embedding_robustness",
+        ),
     ]
 
     global_steps = [
@@ -205,6 +221,29 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
                 continue
             final_cfg = merge_dicts(model_cfg, step_cfg.get("config_overrides", {}))
             call_step(step_name, fn, final_cfg)
+ 
+        for step_name, fn, capability in per_model_steps:
+            step_cfg = ensure_dict(
+                cfg["steps"].get(step_name, {}),
+                f"steps.{step_name}",
+            )
+ 
+            if not should_run(step_cfg):
+                continue
+
+            if not model_bundle.metadata.get(capability, True):
+                print(
+                    f"[PIPELINE] Skipping step={step_name} "
+                    f"model={model_name}; capability {capability}=False"
+                )
+                continue
+
+            final_cfg = merge_dicts(
+                model_cfg,
+                step_cfg.get("config_overrides", {}),
+            )
+            call_step(step_name, fn, final_cfg)
+
 
     global_cfg = copy.deepcopy(common_cfg)
 
