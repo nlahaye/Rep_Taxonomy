@@ -45,49 +45,17 @@ def get_model_name(cfg: Dict[str, Any]) -> str:
 
 
 
-def normalize_image_dict(image: Any) -> Dict[str, torch.Tensor]:
-    if isinstance(image, dict):
-        return image
-    if torch.is_tensor(image):
-        return {"image": image}
-    raise TypeError(f"Unsupported image payload type: {type(image)}")
-
-
-def add_batch_dim(image_dict: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Tensor]:
-    out = {}
-    for modality, value in image_dict.items():
-        if not torch.is_tensor(value):
-            value = torch.as_tensor(value)
-        out[modality] = value.unsqueeze(0).to(device)
-    return out
-
-
-def build_flops_input(model, test_dataset, image_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if getattr(model, "multi_temporal", False) and getattr(test_dataset, "multi_temporal", False):
-        trimmed = {}
-        for k, v in image_dict.items():
-            if v.ndim >= 5:
-                trimmed[k] = v[:, :, 0, :, :]
-            else:
-                trimmed[k] = v
-        return trimmed
-    return image_dict
-
-
-def tensor_shape_map(inpt: Dict[str, torch.Tensor]) -> Dict[str, Tuple[int, ...]]:
-    return {k: tuple(int(x) for x in v.shape) for k, v in inpt.items()}
-
 
 def input_signature(inpt: Dict[str, torch.Tensor]) -> Tuple[Tuple[str, Tuple[int, ...], str], ...]:
     return tuple(sorted(
-        (k, tuple(int(x) for x in v.shape), str(v.dtype))
+        (k, type(v).__name__)
         for k, v in inpt.items()
     ))
 
 
 def serialize_signature(sig: Tuple[Tuple[str, Tuple[int, ...], str], ...]) -> str:
     return json.dumps(
-        [{"modality": k, "shape": list(shape), "dtype": dtype} for k, shape, dtype in sig],
+        [{"modality": k, "dtype": dtype} for k, dtype in sig],
         sort_keys=True,
     )
 
@@ -105,12 +73,19 @@ def parse_numeric_flops(flops_value: Any) -> float:
     suffix = (match.group(2) or "").upper()
 
     scale = {
-        "": 1.0,
-        "K": 1e3,
-        "M": 1e6,
-        "G": 1e9,
-        "T": 1e12,
-        "P": 1e15,
+        "FLOPS": 1.0,
+        "KFLOPS": 1e3,
+        "MFLOPS": 1e6,
+        "GFLOPS": 1e9,
+        "TFLOPS": 1e12,
+        "PFLOPS": 1e15,
+
+        "MACS": 1.0,
+        "KMACS": 1e3,
+        "MMACS": 1e6,
+        "GMACS": 1e9,
+        "TMACS": 1e12,
+        "PMACS": 1e15,
     }
     if suffix not in scale:
         raise ValueError(f"Unsupported FLOPs suffix: {suffix} from {flops_value}")
@@ -130,24 +105,21 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
 
     signature_counter: Counter = Counter()
     signature_examples: Dict[str, Dict[str, torch.Tensor]] = {}
-    sample_total_bytes = []
+    #sample_total_bytes = []
 
     for idx in range(len(test_dataset)):
         sample = test_dataset[idx]
-        image_dict = normalize_image_dict(sample["image"])
-        batched = add_batch_dim(image_dict, device)
-        flops_input = build_flops_input(model, test_dataset, batched)
 
-        sig = input_signature(flops_input)
+        sig = input_signature(sample)
         sig_key = serialize_signature(sig)
         signature_counter[sig_key] += 1
 
         if sig_key not in signature_examples:
-            signature_examples[sig_key] = flops_input
+            signature_examples[sig_key] = sample
 
-        sample_total_bytes.append(
-            int(sum(v.numel() * v.element_size() for v in flops_input.values()))
-        )
+        #sample_total_bytes.append(
+        #    int(sum(v.numel() * v.element_size() for v in sample.values()))
+        #)
 
     out_dir = ensure_dir(os.path.join(cfg["embed_dir"], dataset_name, model_name, "test"))
     stats_dir = ensure_dir(os.path.join(out_dir, "calflops_stats"))
@@ -175,8 +147,6 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
                     "signature": sig_key,
                     "n_samples": int(count),
                     "fraction_of_test_set": float(count / len(test_dataset)),
-                    "input_shapes": json.dumps(tensor_shape_map(example_input), sort_keys=True),
-                    "sample_input_bytes": int(sum(v.numel() * v.element_size() for v in example_input.values())),
                     "flops": flops,
                     "macs": macs,
                     "params": params,
@@ -205,10 +175,10 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
         "min_flops_numeric": min_flops_numeric,
         "max_flops_numeric": max_flops_numeric,
         "params": None if sig_df.empty else sig_df.iloc[0]["params"],
-        "sample_total_input_bytes_mean": float(np.mean(sample_total_bytes)) if sample_total_bytes else 0.0,
-        "sample_total_input_bytes_median": float(np.median(sample_total_bytes)) if sample_total_bytes else 0.0,
-        "sample_total_input_bytes_min": int(min(sample_total_bytes)) if sample_total_bytes else 0,
-        "sample_total_input_bytes_max": int(max(sample_total_bytes)) if sample_total_bytes else 0,
+        #"sample_total_input_bytes_mean": float(np.mean(sample_total_bytes)) if sample_total_bytes else 0.0,
+        #"sample_total_input_bytes_median": float(np.median(sample_total_bytes)) if sample_total_bytes else 0.0,
+        #"sample_total_input_bytes_min": int(min(sample_total_bytes)) if sample_total_bytes else 0,
+        #"sample_total_input_bytes_max": int(max(sample_total_bytes)) if sample_total_bytes else 0,
         "emissions_kg_co2eq": emissions,
         "emissions_g_co2eq": None if emissions is None else emissions * 1000.0,
         "dataset_bundle": cfg.get("dataset_bundle"),
