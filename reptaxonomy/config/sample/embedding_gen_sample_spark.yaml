@@ -1,0 +1,129 @@
+work_dir: /mnt/data/nlahaye/rep_taxonomy//work
+embed_dir: /mnt/data/nlahaye/rep_taxonomy//embeddings
+out_dir: /mnt/data/nlahaye/rep_taxonomy//outputs
+
+
+
+model_names:
+  #- prithvi_eo_v1_100m
+  #- croma_large
+  #- dofa_base
+  - alphaearth_gse
+
+model_init:
+  pretrained: true
+  features_only: true
+  device: cuda
+
+
+
+
+test_batch_size: 1
+test_num_workers: 4
+pin_memory: true
+persistent_workers: true
+
+dataset:
+  name: gse_hlsburnscars
+  dataset_name: gse_hlsburnscars
+  split: test
+  task: segmentation
+  instrument: GSE
+  bands: [E00, E01, E02, E03, E04, E05, E06, E07,
+          E08, E09, E10, E11, E12, E13, E14, E15,
+          E16, E17, E18, E19, E20, E21, E22, E23,
+          E24, E25, E26, E27, E28, E29, E30, E31,
+          E32, E33, E34, E35, E36, E37, E38, E39,
+          E40, E41, E42, E43, E44, E45, E46, E47,
+          E48, E49, E50, E51, E52, E53, E54, E55,
+          E56, E57, E58, E59, E60, E61, E62, E63]
+  target_name: burn_scar
+  bandset: alphaearth-gse-64
+  modalities: [embedding]
+  resolution: 10
+  num_classes: 1
+  ignore_index: 255
+  data_root: /mnt/data/rdemilt/hlsburnscars/
+
+dataset_init:
+  split: test
+  label_name: burn_scar
+  crs: EPSG:5070
+  gse_data_root: /mnt//data/alanderer/gse_hlsburnscars/
+
+
+per_model_overrides:
+  alphaearth_gse:
+    instrument: GSE
+    pooling: none
+  prithvi_eo_v1_100m:
+    weights: /mnt//data/nlahaye/checkpoints/Prithvi_100M.pt
+    image_size: 512
+  croma_large:
+    weights: /mnt//data/nlahaye//checkpoints/CROMA_large.pt
+    modalities: [optical]
+    image_size: 512
+    patch_size: 8
+    encoder_dim: 768
+    encoder_depth: 12
+    num_heads: 16
+    variant: large
+  dofa_base:
+    weights: /mnt/data/nlahaye/checkpoints/DOFA_ViT_base_e100.pth
+    image_size: 512
+    wavelengths:
+      HLS:
+        B2: 0.49
+        B3: 0.56
+        B4: 0.665
+        B5: 0.705
+        B6: 0.74
+        B7: 0.783
+
+split: test
+batch_size: 1
+num_workers: 4
+pin_memory: true
+save_crop_info: true
+overwrite: false
+fail_fast: false
+write_manifest: true
+device: cuda
+
+seed: 42
+n_runs: 3
+projections: [umap, tsne, pca]
+
+steps:
+  compute_resource_reqs:
+    enabled: true
+
+  weight_matrix_analysis:
+    enabled: true
+
+  run_projections:
+    enabled: true
+    config_overrides:
+      n_runs: 3
+      projections: [umap, tsne, pca]
+      device: cuda
+      overwrite: false
+
+  embedding_robustness:
+    enabled: true
+    config_overrides:
+      n_runs: 3
+      id_methods: [MLE, TwoNN, TLE, DANCo, FisherS, MOM, CorrInt, ESS, MiNDML, MiNDKL, MADA]
+      id_k_values: [5, 10, 20]
+      max_id_samples: 20000
+
+  data_kernel_analysis:
+    enabled: true
+
+  geodesic_compare:
+    enabled: true
+
+  demsar_wrapper:
+    enabled: true
+    config_overrides:
+      alpha: 0.05
