@@ -251,6 +251,9 @@ def select_encoder_output(feat: Any) -> torch.Tensor:
 
 def run_model_forward(model: Any, image: Any, dataset_instance: Any, device: str) -> np.ndarray:
     with torch.no_grad():
+        for v in range(len(image["instruments"])):
+            if isinstance(image["instruments"][v], tuple) or isinstance(image["instruments"][v], list): #TODO - this is a hack to resolve extraneous tuples that show up in the instruments list. The culprit is likely in the collation function, but I need to sped some time in their to find it.
+                image["instruments"][v] = image["instruments"][v][0]
         if getattr(model, "multi_temporal", False):
             if getattr(model, "wavelengths", False):
                 feat = model.forward_instruments(image, device=device, permissive=True)
