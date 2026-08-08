@@ -11,11 +11,13 @@ from torchvision.models._api import WeightsEnum
 from gfmtools.data.datasets.epa import EPALabels
 from gfmtools.data.datasets.hlsburnscars import HLSBurnScars
 from gfmtools.data.datasets.landfire import LandfireDataset
-
+from gfmtools.data.datasets.hlsburnscars_prealigned import  HLSBurnScarsPreAlignedEmbeddings
+ 
 from gfmtools.models.resnet import ResNetEncoder
 from gfmtools.models.swin import SwinEncoder
 from gfmtools.models.dofa import DofaEncoder
 from gfmtools.models.croma import CROMAEncoder
+from gfmtools.models.precomputed_embeddings import PrecomputedEmbeddings
 from gfmtools.models.unet import unet
 from gfmtools.models.prithvi import (
     PrithviEncoder,
@@ -120,7 +122,7 @@ def build_test_loader(cfg: Dict[str, Any]) -> DataLoader:
     persistent_workers = bool(cfg.get("persistent_workers", num_workers > 0))
     drop_last = bool(cfg.get("drop_last", False))
 
-    collate_fn = collate_fn = build_forward_instruments_collate_fn(sample_schema) 
+    collate_fn  = build_forward_instruments_collate_fn(sample_schema) 
 
     return DataLoader(
         dataset,
@@ -237,6 +239,18 @@ DATASET_PRESETS: Dict[str, DatasetSpec] = {
         modalities=["optical"],
         resolution=30,
     ),
+    "gse_hlsburnscars": DatasetSpec(
+        name="gse_hlsburnscars",
+        dataset_name="gse_hlsburnscars",
+        split="test",
+        task="segmentation",
+        instrument="GSE",
+        bands=[f"E{i:02d}" for i in range(64)],
+        target_name="burn_scar",
+        bandset="alphaearth-gse-64",
+        modalities=["embedding"],
+        resolution=10,
+    ),
 }
 
 
@@ -244,12 +258,14 @@ DATASET_REGISTRY = {
     "EPALabels": EPALabels,
     "HLSBurnScars": HLSBurnScars,
     "LandfireDataset": LandfireDataset,
+    "HLSBurnScarsPreAlignedEmbeddings": HLSBurnScarsPreAlignedEmbeddings,
 }
 
 DATASET_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "EPALabels": EPALabels,
     "HLSBurnScars": HLSBurnScars,
     "LandfireDataset": LandfireDataset,
+    "HLSBurnScarsPreAlignedEmbeddings": HLSBurnScarsPreAlignedEmbeddings,
 }
 
 # --- model aliases ---
@@ -264,6 +280,11 @@ MODEL_ALIASES: dict[str, dict[str, Any]] = {
     "croma_base": {"family": "croma", "variant": "base"},
     "croma_large": {"family": "croma", "variant": "large"},
     "unet": {"family": "unet", "variant": None},
+
+    "alphaearth_gse": {
+        "family": "precomputed_embedding",
+        "variant": "gse_64",
+    },
 
     # Prithvi-EO encoders
     "prithvi_eo_v1_100m": {"family": "prithvi", "variant": "eo_v1_100m"},
@@ -283,6 +304,7 @@ MODEL_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "CROMAEncoder": CROMAEncoder,
     "unet": unet,
     "PrithviEncoder": PrithviEncoder,
+    "PrecomputedEmbeddings": PrecomputedEmbeddings,
 }
 
 
@@ -381,6 +403,55 @@ def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
         return DatasetBundle(
             dataset_spec=spec,
             dataset_cls=HLSBurnScars,
+            dataset_kwargs=dataset_kwargs,
+            sample_schema=sample_schema,
+            metadata=metadata,
+        )
+
+    if dataset_name == "gse_hlsburnscars":
+        gse_root = init.get("gse_data_root")
+        if not gse_root:
+            raise ValueError(
+                "gse_hlsburnscars requires dataset_init.gse_data_root"
+            )
+
+        dataset_kwargs = {
+            "data_root": spec.data_root or "/mnt/data/rdemilt/hlsburnscars",
+            "label_name": init.get("label_name", "burn_scar"),
+            "split": init.get("split", spec.split or "test"),
+            "crs": init.get("crs", "EPSG:5070"),
+            "additional_instruments": {
+                "GSE": gse_root,
+            },
+        }
+
+        sample_schema = {
+            **common_sample_schema,
+            "instrument": "GSE",
+            "bands": [f"E{i:02d}" for i in range(64)],
+            "target_name": "burn_scar",
+            "filename_key": init.get("filename_key", "filename"),
+            "metadata_filename_key": init.get(
+                "metadata_filename_key",
+                "image_filename",
+            ),
+        }
+
+        metadata = {
+            "dataset_name": dataset_name,
+            "iterable_style": "dict_sample",
+            "embedding_source": "AlphaEarth/GSE",
+            "embedding_instrument": "GSE",
+            "embedding_dim": 64,
+            "embedding_resolution_m": 10,
+            "source_image_instrument": "HLS",
+            "source_image_resolution_m": 30,
+            "precomputed": True,
+        }
+
+        return DatasetBundle(
+            dataset_spec=spec,
+            dataset_cls=HLSBurnScarsPreAlignedEmbeddings,
             dataset_kwargs=dataset_kwargs,
             sample_schema=sample_schema,
             metadata=metadata,
@@ -625,6 +696,35 @@ def build_model_bundle(model_spec: ModelInitSpec, dataset_bundle: DatasetBundle)
             "expected_instrument": ds.instrument,
             "expected_bands": ds.bands,
             "coords_encoding": model_kwargs.get("coords_encoding"),
+        }
+
+    elif model_spec.family == "precomputed_embedding":
+        instrument = model_spec.extra.get("instrument", ds.instrument or "GSE")
+        bands = model_spec.extra.get(
+            "bands",
+            ds.bands or [f"E{i:02d}" for i in range(64)],
+        )
+        pooling = model_spec.extra.get("pooling", "nanmean")
+
+        model_cls = PrecomputedEmbeddings
+        model_kwargs = {
+            "instrument": instrument,
+            "bands": bands,
+            "pooling": pooling,
+        }
+
+        metadata = {
+            "expected_instrument": instrument,
+            "expected_bands": bands,
+            "embedding_source": "precomputed",
+            "embedding_dim": len(bands),
+            "pooling": pooling,
+
+            # Used by full_pipeline.py to decide which stages are applicable.
+            "supports_resource_requirements": False,
+            "supports_weight_matrix_analysis": False,
+            "supports_projection_analysis": True,
+            "supports_embedding_robustness": True,
         }
 
     else:
