@@ -51,7 +51,9 @@ logger = logging.getLogger(__name__)
 
 
 def center_mask(shape_info: Tuple[int, int], frac_low: float = 0.15, frac_high: float = 0.85) -> np.ndarray:
-    h, w = shape_info
+    h, w = list(shape_info)
+    h = int(h)
+    w = int(w)
     rows = np.arange(h * w) // w
     cols = np.arange(h * w) % w
     return (
@@ -139,19 +141,24 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target: Any, crop_info: A
     ind = 1 if embed.ndim > 3 else 0
     tensor = torch.from_numpy(embed)
 
-    if int(math.sqrt(embed.shape[ind])) // 8 > 3:
-        rescale_factor = int(math.sqrt(embed.shape[ind])) // 8
-        while embed.shape[ind] % (rescale_factor ** 2) > 0:
-            rescale_factor += 1
+
+    if image_shape[0] // embed.shape[-1]   > 2:
+        rescale_factor = int(image_shape[0] // embed.shape[-1] // 2)
+
+        #rescale_factor = image_shape[0] // embed.shape[-1] * 8
+   
+
+        #tensor = torch.flatten(tensor, start_dim=0, end_dim=1)
+
+        if tensor.ndim < 3:
+            tensor = tensor.unsqueeze(0)
         tensor = torch.nn.PixelShuffle(rescale_factor)(tensor)
+
 
     if tensor.ndim < 4:
         tensor = tensor.unsqueeze(0)
-    else:
-        tensor = torch.flatten(tensor, start_dim=0, end_dim=1).unsqueeze(0)
-
-    if tensor.shape[-1] != image_shape:
-        tensor = F.interpolate(tensor, size=(image_shape, image_shape), mode="nearest")
+    if tensor.shape[-1] != image_shape[-1] or tensor.shape[-2] != image_shape[-2]:
+        tensor = F.interpolate(tensor, size=(image_shape[0], image_shape[1]), mode="bicubic")
 
     target_np = target.detach().cpu().numpy() if torch.is_tensor(target) else np.asarray(target)
 
@@ -310,8 +317,6 @@ def build_projection_artifacts(
     return rows
 
 
-
-
 def run_knn_gen(cfg: Dict[str, Any]) -> None:
     cfg = ensure_dict(cfg, "run_projections cfg")
 
@@ -334,16 +339,24 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
         run_dir(cfg, run_idx, model_name=model_name)
         dataset_run_dir(cfg, run_idx)
 
-        for data in test_loader:
-            if "filename" in data:
-                image = data["image"]
-                target = data["target"]
-                image_fname = data["filename"][0]
-            else:
-                image = data["image"]
-                target = data["target"]
-                meta = data["metadata"]
-                image_fname = meta["image_filename"][0]
+        for batch_index, data in enumerate(test_loader):
+
+            for v in range(len(data["instruments"])):
+                if isinstance(data["instruments"][v], tuple) or isinstance(data["instruments"][v], list): #TODO - this is a hack to resolve extraneous tuples that show up in the instruments list. The culprit is likely in the collation function, but I need to sped some time in their to find it.
+                    data["instruments"][v] = data["instruments"][v][0]
+
+                for v2 in range(len(data[data["instruments"][v]]["bands"])):
+                    if isinstance(data[data["instruments"][v]]["bands"][v2], tuple) or isinstance(data[data["instruments"][v]]["bands"][v2], list):
+                        data[data["instruments"][v]]["bands"][v2] = data[data["instruments"][v]]["bands"][v2][0]
+            
+            for v in range(len(data["targets"])):
+                if isinstance(data["targets"][v], tuple) or isinstance(data["targets"][v], list):
+                    data["targets"][v] = data["targets"][v][0]
+
+            target = data[data['targets'][0]][data['targets'][0]]['data']
+
+            image_fname = os.path.basename(test_loader.dataset.img_files[batch_index])
+             
 
             embed_fname = embedding_file_path(cfg, image_fname, model_name=model_name, split="test")
             crop_fname = crop_info_file_path(cfg, image_fname, model_name=model_name, split="test")
@@ -351,17 +364,27 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             embed = np.load(embed_fname)
             crop_info_all = np.load(crop_fname, allow_pickle=True).item() if os.path.exists(crop_fname) else None
 
+
+            if embed.ndim < 3:
+                embed = np.expand_dims(embed, axis=0)
+
             crop_info = None
             img_size = None
-            for key, value in image.items():
-                crop_info = crop_info_all[key] if crop_info_all is not None else None
-                img_size = value[:, :, 0, :, :].shape[-1]
+
+            instrument_key = data['instruments'][0]
+            band_key = data[instrument_key]['bands'][0]
+
+            if crop_info_all is not None:
+                crop_info = crop_info_all[instrument_key]
+            img_size = data[instrument_key][band_key]['data'].shape
+            if len(img_size) > 2:
+                img_size = img_size[1:]
 
             if img_size is None:
                 raise ValueError(f"Could not infer image size for {image_fname}")
 
             embed_rescaled, target_np = rescale_embed(embed, img_size, target, crop_info)
-            shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else (img_size, img_size)
+            shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else img_size
 
             indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
             if indices.size == 0:

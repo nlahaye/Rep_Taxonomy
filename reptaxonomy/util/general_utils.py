@@ -3,6 +3,7 @@ import yaml
 
 from typing import Any
 
+from pathlib import Path
 
 def read_yaml(fpath_yaml):
     yml_conf = None

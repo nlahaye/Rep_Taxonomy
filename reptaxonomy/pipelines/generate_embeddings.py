@@ -11,6 +11,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import math
+
 import numpy as np
 import torch
 
@@ -200,24 +202,9 @@ def build_collate_fn(dataset_bundle: Any, model: Any) -> Any:
     return None
 
 
-def get_image_fname(batch: Dict[str, Any], batch_index: int) -> str:
-    if "filename" in batch:
-        value = batch["filename"]
-        if isinstance(value, (list, tuple)):
-            return str(value[0])
-        return str(value)
+def get_image_fname(data: Dataset, batch_index: int) -> str:
 
-    meta = batch.get("metadata", {})
-    if isinstance(meta, dict):
-        for key in ("image_filename", "filename", "image_fname"):
-            if key in meta:
-                value = meta[key]
-                if isinstance(value, (list, tuple)):
-                    return str(value[0])
-                return str(value)
-
-    return f"sample_{batch_index:06d}.tif"
-
+    return data.img_files[batch_index]
 
 def get_crop_info(batch: Dict[str, Any]) -> Optional[Any]:
     return batch.get("crop")
@@ -246,6 +233,11 @@ def select_encoder_output(feat: Any) -> torch.Tensor:
 
     if feat.ndim > 0 and feat.shape[0] == 1:
         feat = feat[0]
+
+
+    if math.sqrt(feat.shape[0]) !=  int(math.sqrt(feat.shape[0])) and math.sqrt(feat.shape[0]-1) == int(math.sqrt((feat.shape[0]-1))): #cls token
+        feat=feat[1:]
+
     return feat
 
 
@@ -254,6 +246,16 @@ def run_model_forward(model: Any, image: Any, dataset_instance: Any, device: str
         for v in range(len(image["instruments"])):
             if isinstance(image["instruments"][v], tuple) or isinstance(image["instruments"][v], list): #TODO - this is a hack to resolve extraneous tuples that show up in the instruments list. The culprit is likely in the collation function, but I need to sped some time in their to find it.
                 image["instruments"][v] = image["instruments"][v][0]
+
+            for v2 in range(len(image[image["instruments"][v]]["bands"])):
+                    if isinstance(image[image["instruments"][v]]["bands"][v2], tuple) or isinstance(image[image["instruments"][v]]["bands"][v2], list):
+                        image[image["instruments"][v]]["bands"][v2] = image[image["instruments"][v]]["bands"][v2][0]
+
+        for v in range(len(image["targets"])):
+                if isinstance(image["targets"][v], tuple) or isinstance(image["targets"][v], list):
+                    image["targets"][v] = image["targets"][v][0]
+
+
         if getattr(model, "multi_temporal", False):
             if getattr(model, "wavelengths", False):
                 feat = model.forward_instruments(image, device=device, permissive=True)
@@ -270,7 +272,10 @@ def run_model_forward(model: Any, image: Any, dataset_instance: Any, device: str
             else:
                 feat = model.forward_instruments(image, device=device)
 
-        feat = select_encoder_output(feat)
+
+        feat = select_encoder_output(feat).swapaxes(0,1)
+ 
+        feat = feat.reshape((feat.shape[0], int(math.sqrt(feat.shape[1])), int(math.sqrt(feat.shape[1]))))
         return feat.detach().cpu().numpy()
 
 
@@ -384,7 +389,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
         loader = build_test_loader(model_cfg)
 
         for batch_idx, batch in enumerate(loader):
-            image_fname = get_image_fname(batch, batch_idx)
+            image_fname = get_image_fname(loader.dataset, batch_idx)
             emb_out = out_dir / f"embd_{Path(image_fname).stem}.npy"
 
             if emb_out.exists() and not bool(model_cfg["overwrite"]):
