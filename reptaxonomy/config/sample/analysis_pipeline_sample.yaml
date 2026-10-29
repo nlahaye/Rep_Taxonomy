@@ -5,7 +5,22 @@ embed_dir: ./embeddings
 out_dir: ./outputs
 seed: 42
 n_runs: 3
-projections: [umap, tsne, pca]
+# "native" = full-dimensional per-pixel embeddings (primary lens).
+# umap / tsne / pca = 2-D projection lenses (sensitivity analysis).
+projections: [native, umap, tsne, pca]
+
+# Token-grid -> pixel upsampling variants. The first entry is the primary variant
+# (written to out_dir); others go to out_dir/upsample_<method> and reuse the same pixels.
+upsample_methods: [pixelshuffle, nearest, bilinear]
+
+# Lens / neighborhood settings shared by run_projections, embedding_robustness,
+# reference_similarity, and invariance_checks (kept top-level so every step agrees).
+knn_metric: euclidean              # k-NN graph + silhouette metric on 2-D projection coordinates
+knn_k: null                        # null -> k = max(2, floor(ln n)); graphs are unweighted, union-symmetrized
+native_normalization: l2           # none | l2 | center | standardize (native lens only)
+native_metric: cosine              # k-NN graph + silhouette metric on native embeddings
+silhouette_sample_size: 20000      # native-lens silhouette subsample (O(n^2) in d dims); null = all points
+projection_silhouette_sample_size: null   # 2-D lenses; null = all points (original behaviour)
 
 dataset:
   name: hlsburnscars
@@ -55,7 +70,15 @@ analysis: {}
 steps:
   compute_resource_reqs:
     enabled: true
-    config_overrides: {}
+    config_overrides:
+      measure_compression_energy: true   # writes <model>.compression.csv / <model>.inference_energy.csv
+      measure_inference_energy: true
+      energy_n_samples: 32               # pre-loaded test batches (batch size = test_batch_size)
+      energy_n_repeats: 8                # forward passes over those batches inside the tracker
+      energy_warmup: 2
+      measure_power_secs: 1
+      inference_precision: fp32          # fp32 | fp16 | bf16 (autocast)
+      test_batch_size: 1                 # batch size for latency / throughput / energy
 
   weight_matrix_analysis:
     enabled: true
@@ -66,7 +89,6 @@ steps:
     config_overrides:
       label_file_subset: 5000
       build_knn: true
-      knn_metric: euclidean
       umap_n_neighbors: 15
       umap_min_dist: 0.1
       umap_n_components: 2
@@ -83,7 +105,29 @@ steps:
 
   data_kernel_analysis:
     enabled: true
-    config_overrides: {}
+    config_overrides:
+      pvalue_plus_one: false             # true -> (1 + #{null >= T}) / (1 + B)
+
+  reference_similarity:
+    enabled: true
+    config_overrides:
+      cka_max_samples: 20000             # rows used for linear CKA
+      cka_debiased_samples: 0            # >0 also computes debiased CKA on this many rows
+      cka_native_raw: true               # native-lens CKA on raw (un-normalized) embeddings
+
+  invariance_checks:
+    enabled: true
+    config_overrides:
+      invariance_run: 0
+      invariance_n_samples: 2000
+      invariance_lenses: [native, pca]   # umap / tsne are stochastic -> reported as approximate
+      invariance_pairs: null             # null -> first two models
+      translation_scale: 5.0
+      scale_factor: 3.7
+      invariance_tol: 1.0e-6             # silhouette
+      graph_jaccard_tol: 0.01            # k-NN tie-breaking
+      residual_tol: 0.05                 # bootstrap re-assignment under permutation
+      distance_rel_tol: 0.01             # randomized SVD in OmnibusEmbed
 
   geodesic_compare:
     enabled: true
@@ -94,3 +138,18 @@ steps:
     enabled: true
     config_overrides:
       alpha: 0.05
+
+  cross_perspective_synthesis:
+    enabled: true
+    config_overrides:
+      synthesis:
+        datasets: null                   # null -> this pipeline's dataset; list for cross-dataset runs
+        training_pairs: []               # e.g. [[resnet50_pretrained, resnet50_scratch]]
+        robustness_rank_by: mean         # mean | median | median_minus_iqr | min
+        layer_fit_rank_by: frac_in_range # frac_in_range | median_distance
+        compute_rank_by: gflops          # gflops | gmacs | params
+        emissions_rank_by: kg_co2eq_per_sample
+        mantel_permutations: 10000
+        primary_lens: native
+        reference_metrics: [linear_cka, knn_jaccard]
+        # variants / primary_variant are filled in by full_pipeline from upsample_methods

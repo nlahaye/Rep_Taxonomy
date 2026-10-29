@@ -1,0 +1,46 @@
+# Standalone cross-dataset synthesis (run after the per-dataset pipelines):
+#   python -m reptaxonomy.summarize.cross_perspective_synthesis -y synthesis_sample.yaml
+
+embed_dir: ./embeddings
+out_dir: ./outputs
+projections: [native, umap, tsne, pca]
+
+model_names:
+  - croma_base
+  - dofa_base
+  - satlas_swinb
+  - prithvi_eo_v2_300
+  - resnet50_pretrained
+  - resnet50_scratch
+
+synthesis:
+  datasets: [hlsburnscars, mados, sen1floods11]
+  out_subdir: synthesis
+  display_names:
+    croma_base: CROMA
+    dofa_base: DOFA
+    satlas_swinb: Satlas
+    prithvi_eo_v2_300: Prithvi-EO-2.0
+    resnet50_pretrained: ResNet50 (pre.)
+    resnet50_scratch: ResNet50 (scr.)
+  training_pairs:
+    - [resnet50_pretrained, resnet50_scratch]
+  residual_source: auto          # auto | signed | ece
+  mantel_permutations: 10000
+  mantel_method: spearman        # spearman | pearson
+  alpha_range: [2.0, 5.0]
+  alpha_dataset: null            # weights are dataset agnostic; first dataset with ww_stats is used
+  resource_dataset: null         # null -> mean over datasets; or e.g. hlsburnscars
+  robustness_rank_by: mean
+  layer_fit_rank_by: frac_in_range
+  compute_rank_by: gflops
+  emissions_rank_by: kg_co2eq_per_sample
+  require_full_design: false
+  figure_formats: [pdf, png]
+  primary_lens: native
+  reference_metrics: [linear_cka, knn_jaccard]
+  primary_variant: pixelshuffle
+  variants:
+    pixelshuffle: ./outputs
+    nearest: ./outputs/upsample_nearest
+    bilinear: ./outputs/upsample_bilinear

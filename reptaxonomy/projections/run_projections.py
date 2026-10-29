@@ -137,10 +137,45 @@ def get_indices(
     return final_inds
 
 
-def rescale_embed(embed: np.ndarray, image_shape: int, target: Any, crop_info: Any = None) -> Tuple[np.ndarray, np.ndarray]:
-    ind = 1 if embed.ndim > 3 else 0
+UPSAMPLE_METHODS = ("pixelshuffle", "nearest", "bilinear")
+
+
+def rescale_embed(
+    embed: np.ndarray,
+    image_shape: int,
+    target: Any,
+    crop_info: Any = None,
+    method: str = "pixelshuffle",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map a token grid (C, h, w) to per-pixel embeddings (H*W, C').
+
+    method:
+      pixelshuffle : original behaviour. PixelShuffle by r = H // w // 2 (C' = C / r^2),
+                     then bicubic interpolation to (H, W).
+      nearest      : nearest-token assignment. Every pixel receives the embedding of
+                     the token whose footprint contains it (C' = C).
+      bilinear     : bilinear interpolation of the token grid to (H, W)
+                     (align_corners=False, C' = C).
+    """
+    method = str(method).lower()
+    if method not in UPSAMPLE_METHODS:
+        raise ValueError(f"Unsupported upsample_method '{method}'; choose from {UPSAMPLE_METHODS}")
     tensor = torch.from_numpy(embed)
 
+    if method in ("nearest", "bilinear"):
+        if tensor.ndim < 3:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim < 4:
+            tensor = tensor.unsqueeze(0)
+        tensor = tensor.float()
+        if tensor.shape[-2] != image_shape[0] or tensor.shape[-1] != image_shape[1]:
+            if method == "nearest":
+                tensor = F.interpolate(tensor, size=(image_shape[0], image_shape[1]), mode="nearest-exact")
+            else:
+                tensor = F.interpolate(
+                    tensor, size=(image_shape[0], image_shape[1]), mode="bilinear", align_corners=False
+                )
+        return _finalize_rescaled(tensor, target, crop_info)
 
     if image_shape[0] // embed.shape[-1]   > 2:
         rescale_factor = int(image_shape[0] // embed.shape[-1] // 2)
@@ -160,6 +195,73 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target: Any, crop_info: A
     if tensor.shape[-1] != image_shape[-1] or tensor.shape[-2] != image_shape[-2]:
         tensor = F.interpolate(tensor, size=(image_shape[0], image_shape[1]), mode="bicubic")
 
+    return _finalize_rescaled(tensor, target, crop_info)
+
+
+def prepare_target(target: Any, crop_info: Any = None) -> np.ndarray:
+    """Flattened full-frame target, zero-padded outside the crop (same as rescale_embed)."""
+    target_np = target.detach().cpu().numpy() if torch.is_tensor(target) else np.asarray(target)
+    if crop_info is not None:
+        out_h, out_w = int(crop_info[0][-2]), int(crop_info[0][-1])
+        full_target = np.zeros((1, out_h, out_w), dtype=target_np.dtype)
+        full_target[:, crop_info[1]:crop_info[1] + crop_info[3], crop_info[2]:crop_info[2] + crop_info[4]] = target_np
+        target_np = full_target
+    return target_np.reshape(-1)
+
+
+def sample_tokens_at_pixels(
+    embed: np.ndarray,
+    image_shape: Tuple[int, int],
+    indices: np.ndarray,
+    crop_info: Any = None,
+    method: str = "nearest",
+) -> np.ndarray:
+    """Per-pixel embeddings at selected flat pixel indices without materializing (H*W, C).
+
+    Numerically identical to rescale_embed(method=...) followed by [indices]:
+      nearest  : token (floor((r + 0.5) h / H), floor((c + 0.5) w / W))  == 'nearest-exact'
+      bilinear : grid_sample(align_corners=False, padding='border') == F.interpolate bilinear
+    Pixels outside the crop window receive zero vectors, as in rescale_embed.
+    """
+    E = torch.from_numpy(np.asarray(embed)).float()
+    while E.ndim > 3:
+        E = E[0]
+    if E.ndim == 2:
+        E = E.unsqueeze(0)
+    C, h, w = E.shape
+    H, W = int(image_shape[0]), int(image_shape[1])
+
+    if crop_info is not None:
+        full_w = int(crop_info[0][-1])
+        r0, c0 = int(crop_info[1]), int(crop_info[2])
+    else:
+        full_w, r0, c0 = W, 0, 0
+
+    rows = indices // full_w - r0
+    cols = indices % full_w - c0
+    inside = (rows >= 0) & (rows < H) & (cols >= 0) & (cols < W)
+    out = np.zeros((indices.size, C), dtype=np.float32)
+    if not np.any(inside):
+        return out
+    rr = rows[inside].astype(np.float64)
+    cc = cols[inside].astype(np.float64)
+
+    if method == "nearest":
+        ti = np.clip(np.floor((rr + 0.5) * h / H).astype(np.int64), 0, h - 1)
+        tj = np.clip(np.floor((cc + 0.5) * w / W).astype(np.int64), 0, w - 1)
+        out[inside] = E[:, ti, tj].T.numpy()
+    elif method == "bilinear":
+        gx = torch.from_numpy(2.0 * (cc + 0.5) / W - 1.0).float()
+        gy = torch.from_numpy(2.0 * (rr + 0.5) / H - 1.0).float()
+        grid = torch.stack([gx, gy], dim=-1).view(1, 1, -1, 2)
+        vals = F.grid_sample(E.unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=False)
+        out[inside] = vals[0, :, 0, :].T.numpy()
+    else:
+        raise ValueError(f"sample_tokens_at_pixels does not support method '{method}'")
+    return out
+
+
+def _finalize_rescaled(tensor: torch.Tensor, target: Any, crop_info: Any) -> Tuple[np.ndarray, np.ndarray]:
     target_np = target.detach().cpu().numpy() if torch.is_tensor(target) else np.asarray(target)
 
     if crop_info is not None:
@@ -178,12 +280,72 @@ def rescale_embed(embed: np.ndarray, image_shape: int, target: Any, crop_info: A
     return embed_np, target_np
 
 
+NATIVE_LENS = "native"
+
+
+def normalize_native(embed: np.ndarray, mode: str = "l2") -> np.ndarray:
+    """Normalization applied to native embeddings before native-space neighborhoods/silhouette.
+
+    none        : raw per-pixel embeddings
+    l2          : each pixel vector divided by its L2 norm (Euclidean distance on the
+                  result is a monotone function of cosine distance)
+    standardize : per-feature z-score over the subset (mean 0, unit variance)
+    center      : per-feature mean removal only
+    """
+    mode = str(mode).lower()
+    X = np.asarray(embed, dtype=np.float32)
+    if mode == "none":
+        return X
+    if mode == "l2":
+        return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    if mode == "center":
+        return X - X.mean(axis=0, keepdims=True)
+    if mode == "standardize":
+        return (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-12)
+    raise ValueError(f"Unsupported native_normalization '{mode}'")
+
+
+def lens_metric(cfg: Dict[str, Any], projection: str) -> str:
+    """Neighborhood / silhouette metric for a lens (native vs 2-D projection)."""
+    if projection == NATIVE_LENS:
+        return str(cfg.get("native_metric", "cosine"))
+    return str(cfg.get("knn_metric", "euclidean"))
+
+
+def knn_k(cfg: Dict[str, Any], n: int) -> int:
+    """k = max(2, floor(ln n)) unless knn_k is set explicitly."""
+    if cfg.get("knn_k") is not None:
+        return int(cfg["knn_k"])
+    return max(2, int(np.log(max(3, n))))
+
+
+def silhouette_sample_size(cfg: Dict[str, Any], projection: str):
+    """Native lens: `silhouette_sample_size`; 2-D projections: `projection_silhouette_sample_size`
+    (default None = all points, which preserves the original projection results)."""
+    key = "silhouette_sample_size" if projection == NATIVE_LENS else "projection_silhouette_sample_size"
+    return cfg.get(key)
+
+
+def lens_silhouette(X: np.ndarray, y: np.ndarray, metric: str, cfg: Dict[str, Any], run_idx: int,
+                    projection: str = NATIVE_LENS) -> float:
+    sample_size = silhouette_sample_size(cfg, projection)
+    if sample_size is not None and X.shape[0] > int(sample_size):
+        return float(metrics.silhouette_score(
+            X, y, metric=metric, sample_size=int(sample_size),
+            random_state=int(cfg.get("seed", 42)) + run_idx,
+        ))
+    return float(metrics.silhouette_score(X, y, metric=metric))
+
+
 def fit_or_load_projection(
     embed: np.ndarray,
     cfg: Dict[str, Any],
     run_idx: int,
     projection: str,
 ) -> np.ndarray:
+    if projection == NATIVE_LENS:
+        return normalize_native(embed, cfg.get("native_normalization", "l2"))
+
     reducer_fname = reducer_model_path(cfg, run_idx, projection)
 
     if projection == "umap":
@@ -278,15 +440,22 @@ def build_projection_artifacts(
 
     for projection in projection_names:
         projection_data = fit_or_load_projection(embed_full, cfg, run_idx, projection)
-        projection_2d = normalize_projection_for_raster(projection_data)
-
-        tif_path = projection_label_tif_path(cfg, run_idx, projection, model_name=model_name)
-        write_projection_label_tif(projection_2d, target_full, tif_path)
-
+        metric = lens_metric(cfg, projection)
         projection_save_path = projection_path(cfg, run_idx, projection, model_name=model_name)
-        np.save(projection_save_path, projection_data[:, :2])
 
-        silhouette = metrics.silhouette_score(projection_data[:, :2], target_full)
+        if projection == NATIVE_LENS:
+            # Native lens: full-dimensional (normalized) embeddings; no raster, no 2-D truncation.
+            coords = projection_data
+            tif_path = None
+            np.save(projection_save_path, coords.astype(np.float32, copy=False))
+        else:
+            coords = projection_data[:, :2]
+            projection_2d = normalize_projection_for_raster(projection_data)
+            tif_path = projection_label_tif_path(cfg, run_idx, projection, model_name=model_name)
+            write_projection_label_tif(projection_2d, target_full, tif_path)
+            np.save(projection_save_path, coords)
+
+        silhouette = lens_silhouette(coords, target_full, metric, cfg, run_idx, projection)
 
         row = {
             "run": run_idx,
@@ -295,22 +464,22 @@ def build_projection_artifacts(
             "mean_sil": float(silhouette),
             "std_sil": 0.0,
             "n_points": int(projection_data.shape[0]),
+            "lens_dim": int(coords.shape[1]),
+            "lens_metric": metric,
+            "native_normalization": cfg.get("native_normalization", "l2") if projection == NATIVE_LENS else None,
+            "upsample_method": str(cfg.get("upsample_method", "pixelshuffle")),
             "projection_path": projection_save_path,
             "label_tif_path": tif_path,
         }
 
         if bool(cfg.get("build_knn", True)):
-            k = max(2, int(np.log(max(3, projection_2d.shape[0]))))
-            graph = build_sparse_knn_graph(
-                projection_data[:, :2],
-                k=k,
-                metric=str(cfg.get("knn_metric", "euclidean")),
-            )
+            k = knn_k(cfg, coords.shape[0])
+            graph = build_sparse_knn_graph(coords, k=k, metric=metric)
             graph_path = knn_graph_path(cfg, run_idx, projection, model_name=model_name)
             save_sparse_graph(graph, graph_path)
             row["knn_graph_path"] = graph_path
             row["knn_k"] = int(k)
-            row["knn_metric"] = str(cfg.get("knn_metric", "euclidean"))
+            row["knn_metric"] = metric
 
         rows.append(row)
 
@@ -383,14 +552,24 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             if img_size is None:
                 raise ValueError(f"Could not infer image size for {image_fname}")
 
-            embed_rescaled, target_np = rescale_embed(embed, img_size, target, crop_info)
+            upsample_method = str(cfg.get("upsample_method", "pixelshuffle")).lower()
             shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else img_size
 
-            indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
-            if indices.size == 0:
-                continue
+            if upsample_method == "pixelshuffle":
+                embed_rescaled, target_np = rescale_embed(embed, img_size, target, crop_info, method=upsample_method)
+                indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
+                if indices.size == 0:
+                    continue
+                embed_sel = embed_rescaled[indices, :]
+            else:
+                # nearest / bilinear: sample tokens only at the selected pixels (memory safe).
+                target_np = prepare_target(target, crop_info)
+                indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
+                if indices.size == 0:
+                    continue
+                embed_sel = sample_tokens_at_pixels(embed, img_size, indices, crop_info, method=upsample_method)
 
-            embed_batches.append(embed_rescaled[indices, :].astype(np.float32, copy=False))
+            embed_batches.append(embed_sel.astype(np.float32, copy=False))
             target_batches.append(target_np[indices].astype(np.int32, copy=False))
 
         if not embed_batches:

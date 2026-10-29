@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -18,6 +19,9 @@ from reptaxonomy.intercompare.geodesic_compare import run_geodesic_compare
 from reptaxonomy.resources.compute_resource_reqs import compute_resource_reqs
 from reptaxonomy.robustness.weight_matrix_analysis import run_weight_mtx_analysis
 from reptaxonomy.summarize.demsar_wrapper import demsar_wrapper
+from reptaxonomy.summarize.cross_perspective_synthesis import run_cross_perspective_synthesis
+from reptaxonomy.intercompare.reference_similarity import run_reference_similarity
+from reptaxonomy.robustness.invariance_checks import run_invariance_checks
 
 from reptaxonomy.util.experiment_init_utils import (
     build_dataset_bundle,
@@ -95,7 +99,8 @@ def validate_pipeline_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("out_dir", "./outputs")
     cfg.setdefault("n_runs", 3)
     cfg.setdefault("seed", 42)
-    cfg.setdefault("projections", ["umap", "tsne", "pca"])
+    cfg.setdefault("projections", ["native", "umap", "tsne", "pca"])
+    cfg.setdefault("upsample_methods", [cfg.get("upsample_method", "pixelshuffle")])
     cfg.setdefault("dataset_init", {})
     cfg.setdefault("model_init", {})
     cfg.setdefault("analysis", {})
@@ -158,6 +163,43 @@ def call_step(step_name: str, fn, cfg: Dict[str, Any]) -> None:
     fn(cfg)
 
 
+# Steps whose outputs do not depend on how token grids are upsampled to pixels.
+UPSAMPLE_INDEPENDENT_STEPS = {"compute_resource_reqs", "weight_matrix_analysis"}
+
+# Global steps that are evaluated once on the primary variant only.
+PRIMARY_ONLY_GLOBAL_STEPS = {"invariance_checks"}
+
+
+def variant_out_dir(base_out_dir: str, method: str, primary: str) -> str:
+    """Primary upsampling variant writes to out_dir; others to out_dir/upsample_<method>."""
+    return base_out_dir if method == primary else os.path.join(base_out_dir, f"upsample_{method}")
+
+
+def run_step_block(
+    steps: List[Any],
+    cfg: Dict[str, Any],
+    base_cfg: Dict[str, Any],
+    model_bundle: Any = None,
+    skip: set | None = None,
+) -> None:
+    for item in steps:
+        step_name, fn = item[0], item[1]
+        capability = item[2] if len(item) > 2 else None
+        if skip and step_name in skip:
+            continue
+        step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
+        if not should_run(step_cfg):
+            continue
+        if capability is not None and model_bundle is not None and not model_bundle.metadata.get(capability, True):
+            print(
+                f"[PIPELINE] Skipping step={step_name} "
+                f"model={base_cfg.get('encoder')}; capability {capability}=False"
+            )
+            continue
+        final_cfg = merge_dicts(base_cfg, step_cfg.get("config_overrides", {}))
+        call_step(step_name, fn, final_cfg)
+
+
 def run_full_pipeline(cfg: Dict[str, Any]) -> None:
     cfg = validate_pipeline_cfg(cfg)
 
@@ -174,85 +216,68 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
     common_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle)
 
     per_model_steps = [
-        (
-            "compute_resource_reqs",
-            compute_resource_reqs,
-            "supports_resource_requirements",
-        ),
-        (
-            "weight_matrix_analysis",
-            run_weight_mtx_analysis,
-            "supports_weight_matrix_analysis",
-        ),
-        (
-            "run_projections",
-            run_knn_gen,
-            "supports_projection_analysis",
-        ),
-        (
-            "embedding_robustness",
-            analyze_robustness,
-            "supports_embedding_robustness",
-        ),
+        ("compute_resource_reqs", compute_resource_reqs, "supports_resource_requirements"),
+        ("weight_matrix_analysis", run_weight_mtx_analysis, "supports_weight_matrix_analysis"),
+        ("run_projections", run_knn_gen, "supports_projection_analysis"),
+        ("embedding_robustness", analyze_robustness, "supports_embedding_robustness"),
     ]
 
     global_steps = [
         ("data_kernel_analysis", run_data_kernel_analysis),
+        ("reference_similarity", run_reference_similarity),
+        ("invariance_checks", run_invariance_checks),
         ("geodesic_compare", run_geodesic_compare),
         ("demsar_wrapper", demsar_wrapper),
     ]
 
-    shared_model_init = ensure_dict(cfg.get("model_init", {}), "model_init")
+    # Final, cross-variant synthesis (runs once after every variant is complete).
+    final_steps = [("cross_perspective_synthesis", run_cross_perspective_synthesis)]
 
+    shared_model_init = ensure_dict(cfg.get("model_init", {}), "model_init")
+    base_out_dir = str(cfg["out_dir"])
+    methods = [str(m).lower() for m in cfg["upsample_methods"]]
+    primary = methods[0]
+    variants: Dict[str, str] = {}
+
+    model_bundles = {}
     for model_name in cfg["model_names"]:
         per_model_cfg = ensure_dict(
             cfg.get("per_model_overrides", {}).get(model_name, {}),
             f"per_model_overrides.{model_name}",
         )
         model_spec = resolve_model_spec(model_name, shared_model_init, per_model_cfg)
-        model_bundle = build_model_bundle(model_spec, dataset_bundle)
+        model_bundles[model_name] = build_model_bundle(model_spec, dataset_bundle)
 
-        model_cfg = attach_bundles_to_cfg(common_cfg, dataset_bundle, model_bundle)
-        model_cfg["encoder"] = model_name
+    for method in methods:
+        out_dir = variant_out_dir(base_out_dir, method, primary)
+        variants[method] = out_dir
+        variant_cfg = copy.deepcopy(common_cfg)
+        variant_cfg["out_dir"] = out_dir
+        variant_cfg["upsample_method"] = method
+        # Every variant samples the same pixels as the primary variant.
+        variant_cfg["index_cache_root"] = base_out_dir
+        print(f"[PIPELINE] Upsampling variant={method} out_dir={out_dir}")
 
-        for step_name, fn, _ in per_model_steps:
-            step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
-            if not should_run(step_cfg):
-                continue
-            final_cfg = merge_dicts(model_cfg, step_cfg.get("config_overrides", {}))
-            call_step(step_name, fn, final_cfg)
- 
-        for step_name, fn, capability in per_model_steps:
-            step_cfg = ensure_dict(
-                cfg["steps"].get(step_name, {}),
-                f"steps.{step_name}",
+        for model_name, model_bundle in model_bundles.items():
+            model_cfg = attach_bundles_to_cfg(variant_cfg, dataset_bundle, model_bundle)
+            model_cfg["encoder"] = model_name
+            run_step_block(
+                per_model_steps, cfg, model_cfg, model_bundle=model_bundle,
+                skip=None if method == primary else UPSAMPLE_INDEPENDENT_STEPS,
             )
- 
-            if not should_run(step_cfg):
-                continue
 
-            if not model_bundle.metadata.get(capability, True):
-                print(
-                    f"[PIPELINE] Skipping step={step_name} "
-                    f"model={model_name}; capability {capability}=False"
-                )
-                continue
+        run_step_block(
+            global_steps, cfg, copy.deepcopy(variant_cfg),
+            skip=None if method == primary else PRIMARY_ONLY_GLOBAL_STEPS,
+        )
 
-            final_cfg = merge_dicts(
-                model_cfg,
-                step_cfg.get("config_overrides", {}),
-            )
-            call_step(step_name, fn, final_cfg)
-
-
-    global_cfg = copy.deepcopy(common_cfg)
-
-    for step_name, fn in global_steps:
-        step_cfg = ensure_dict(cfg["steps"].get(step_name, {}), f"steps.{step_name}")
-        if not should_run(step_cfg):
-            continue
-        final_cfg = merge_dicts(global_cfg, step_cfg.get("config_overrides", {}))
-        call_step(step_name, fn, final_cfg)
+    final_cfg = copy.deepcopy(common_cfg)
+    final_cfg["out_dir"] = base_out_dir
+    syn = dict(final_cfg.get("synthesis", {}) or {})
+    syn.setdefault("variants", variants)
+    syn.setdefault("primary_variant", primary)
+    final_cfg["synthesis"] = syn
+    run_step_block(final_steps, cfg, final_cfg)
 
 
 def main() -> None:

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from scipy.sparse import csr_array, load_npz
+from scipy.sparse import csr_array, csr_matrix, load_npz
 from graspologic.embed import AdjacencySpectralEmbed, ClassicalMDS, OmnibusEmbed
 from graspologic.simulations import rdpg
 
@@ -47,6 +47,17 @@ def expected_calibration_error(expected: np.ndarray, observed: np.ndarray, total
         weights = total_count / total_count.sum()
         return float((abs_diff * weights).sum())
     return float(abs_diff.mean())
+
+
+def signed_residual(p_values: np.ndarray) -> float:
+    """Signed residual of the p-value ECDF from uniform.
+
+    rho = integral_0^1 (F_hat(u) - u) du = 1/2 - mean(p).
+    Positive -> p-values concentrated near 0 (models differ more than the null);
+    negative -> p-values concentrated near 1 (more similar than the null).
+    """
+    p = np.asarray(p_values, dtype=float)
+    return float(0.5 - p.mean()) if p.size else float("nan")
 
 
 def plot_calibration(
@@ -140,6 +151,37 @@ def build_dist_mtx_cached(model_names: List[str], knn_graphs: Dict[str, csr_arra
     return dist_matrix
 
 
+def pair_kernel_statistics(
+    graph_a: csr_array,
+    graph_b: csr_array,
+    number_of_bootstraps: int = 10,
+    n_components: int = 1,
+    seed: int = 42,
+    pvalue_plus_one: bool = False,
+) -> Dict[str, Any]:
+    """Data-kernel statistics for a single model pair, without plotting.
+
+    Mirrors run_taxonomic_analysis for two graphs: omnibus embedding (2 components),
+    per-node test statistic ||Z_a(i) - Z_b(i)||, RDPG bootstrap null from graph_a's ASE,
+    per-node p-values, signed residual, and relative Frobenius distance
+    ||Z_a - Z_b||_F / ||Z_a + Z_b||_F. Used by the invariance checks.
+    """
+    graph_a = csr_matrix(graph_a, dtype=np.float64)
+    graph_b = csr_matrix(graph_b, dtype=np.float64)
+    omni = np.squeeze(OmnibusEmbed(n_components=2).fit_transform([graph_a, graph_b]))
+    stat = np.linalg.norm(omni[0] - omni[1], axis=1)
+    ase = AdjacencySpectralEmbed(n_components=n_components, svd_seed=seed).fit_transform(graph_a)
+    null = bootstrap_null_from_latents(graph_a, ase, number_of_bootstraps, n_components, acorn=seed)
+    exceed = (null >= stat[:, None]).sum(axis=1)
+    if pvalue_plus_one:
+        p = (1.0 + exceed) / (1.0 + null.shape[1])
+    else:
+        p = exceed / null.shape[1]
+    rel = float(np.linalg.norm(omni[0] - omni[1]) / (np.linalg.norm(omni[0] + omni[1]) + 1e-8))
+    return {"p_values": p, "residual": signed_residual(p), "ece": expected_calibration_error(
+        np.linspace(0, 1, 500), get_cdf(p, 500)), "rel_frobenius": rel}
+
+
 def plot_multi_embed(omni_embds: np.ndarray, model_names: List[str], out_dir: str) -> None:
     fig, ax = plt.subplots()
     for i, model_name in enumerate(model_names):
@@ -211,7 +253,9 @@ def run_taxonomic_analysis(
     n_components: int = 1,
     top_frac: float = 1.0,
     seed: int = 42,
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    pvalue_plus_one: bool = False,
+    return_extras: bool = False,
+):
     os.makedirs(out_dir, exist_ok=True)
 
     ordered_graphs = [knn_graphs[m] for m in model_names]
@@ -240,12 +284,19 @@ def run_taxonomic_analysis(
 
     ece_dict = {m: {} for m in model_names}
     dist_dict = {m: {} for m in model_names}
+    residual_dict = {m: {} for m in model_names}
 
     for i, model_name in enumerate(model_names):
         for j, model_name2 in enumerate(model_names):
             test_statistics = pairwise_stats[(model_name, model_name2)]
             null_dist = null_cache[model_name]
-            p_values = (null_dist >= test_statistics[:, None]).mean(axis=1)
+            exceed = (null_dist >= test_statistics[:, None]).sum(axis=1)
+            if pvalue_plus_one:
+                # (1 + #{null >= T}) / (1 + B): never exactly zero (Phipson & Smyth, 2010).
+                p_values = (1.0 + exceed) / (1.0 + null_dist.shape[1])
+            else:
+                p_values = exceed / null_dist.shape[1]
+            residual_dict[model_name][model_name2] = signed_residual(p_values)
 
             if top_frac < 1.0:
                 top_k = max(1, int(len(test_statistics) * top_frac))
@@ -282,6 +333,12 @@ def run_taxonomic_analysis(
         for j, m2 in enumerate(model_names):
             dist_dict[m1][m2] = float(np.linalg.norm(cmds_embds[i] - cmds_embds[j]))
 
+    if return_extras:
+        raw_dist_dict = {
+            m1: {m2: float(dist_matrix[i, j]) for j, m2 in enumerate(model_names)}
+            for i, m1 in enumerate(model_names)
+        }
+        return ece_dict, dist_dict, residual_dict, raw_dist_dict
     return ece_dict, dist_dict
 
 
@@ -395,6 +452,8 @@ def run_data_kernel_analysis(cfg: Dict[str, Any]) -> None:
 
     pairwise_ece_rows: List[Dict[str, Any]] = []
     pairwise_dist_rows: List[Dict[str, Any]] = []
+    pairwise_residual_rows: List[Dict[str, Any]] = []
+    pairwise_raw_dist_rows: List[Dict[str, Any]] = []
     diff_rows: List[Dict[str, Any]] = []
 
     for run_idx in range(n_runs):
@@ -412,7 +471,7 @@ def run_data_kernel_analysis(cfg: Dict[str, Any]) -> None:
             )
 
             projection_out_dir = projection_analysis_dir(cfg, run_idx, projection)
-            ece_dict, dist_dict = run_taxonomic_analysis(
+            ece_dict, dist_dict, residual_dict, raw_dist_dict = run_taxonomic_analysis(
                 model_names=model_names,
                 knn_graphs=knn_graphs,
                 out_dir=projection_out_dir,
@@ -420,6 +479,8 @@ def run_data_kernel_analysis(cfg: Dict[str, Any]) -> None:
                 n_components=int(cfg.get("ase_n_components", 1)),
                 top_frac=float(cfg.get("top_frac", 1.0)),
                 seed=int(cfg.get("seed", 42)),
+                pvalue_plus_one=bool(cfg.get("pvalue_plus_one", False)),
+                return_extras=True,
             )
 
             ece_dict_full[projection] = ece_dict
@@ -427,6 +488,10 @@ def run_data_kernel_analysis(cfg: Dict[str, Any]) -> None:
 
             pairwise_ece_rows.extend(flatten_nested_matrix(run_idx, projection, ece_dict, "ece"))
             pairwise_dist_rows.extend(flatten_nested_matrix(run_idx, projection, dist_dict, "distance"))
+            pairwise_residual_rows.extend(flatten_nested_matrix(run_idx, projection, residual_dict, "residual"))
+            pairwise_raw_dist_rows.extend(
+                flatten_nested_matrix(run_idx, projection, raw_dist_dict, "omnibus_rel_frobenius")
+            )
 
         dist_dicts.append(dist_dict_full)
         ece_dicts.append(ece_dict_full)
@@ -459,6 +524,12 @@ def run_data_kernel_analysis(cfg: Dict[str, Any]) -> None:
         pd.DataFrame(pairwise_ece_rows).to_csv(os.path.join(out_root, "pairwise_ece_summary.csv"), index=False)
     if pairwise_dist_rows:
         pd.DataFrame(pairwise_dist_rows).to_csv(os.path.join(out_root, "pairwise_distance_summary.csv"), index=False)
+    if pairwise_residual_rows:
+        pd.DataFrame(pairwise_residual_rows).to_csv(os.path.join(out_root, "pairwise_residual_summary.csv"), index=False)
+    if pairwise_raw_dist_rows:
+        pd.DataFrame(pairwise_raw_dist_rows).to_csv(
+            os.path.join(out_root, "pairwise_omnibus_distance_summary.csv"), index=False
+        )
     if diff_rows:
         pd.DataFrame(diff_rows).to_csv(os.path.join(out_root, "projection_difference_summary.csv"), index=False)
 

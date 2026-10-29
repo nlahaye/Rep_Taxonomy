@@ -164,7 +164,14 @@ def silhouette_stats_path(cfg: Dict[str, Any], model_name: Optional[str] = None)
 
 
 def index_cache_path(cfg: Dict[str, Any], run_idx: int, image_fname: str) -> str:
-    return os.path.join(dataset_run_dir(cfg, run_idx), f"{os.path.splitext(image_fname)[0]}.indices.zarr")
+    """Pixel-index cache. `index_cache_root` lets upsampling variants share the primary
+    variant's sampled pixels so every variant is evaluated on identical locations."""
+    root = cfg.get("index_cache_root")
+    base = (
+        ensure_dir(os.path.join(root, get_dataset_name(cfg), f"run_{run_idx}"))
+        if root else dataset_run_dir(cfg, run_idx)
+    )
+    return os.path.join(base, f"{os.path.splitext(image_fname)[0]}.indices.zarr")
 
 
 def embedding_file_path(cfg: Dict[str, Any], image_fname: str, model_name: Optional[str] = None, split: str = "test") -> str:

@@ -107,14 +107,31 @@ def analyze_robustness(cfg: Dict[str, Any]):
             proj_path = os.path.join(run_dir, f"{encoder_name}.{dataset_name}.{projection.upper()}.projection.npy")
             if not os.path.exists(proj_path):
                 continue
-            proj = np.load(proj_path, mmap_mode="r")
-            sil = metrics.silhouette_score(np.asarray(proj), np.asarray(target_full))
+            proj = np.asarray(np.load(proj_path, mmap_mode="r"))
+            # Native lens: full-dimensional normalized embeddings with native_metric (default cosine);
+            # projections: 2-D coordinates with knn_metric (default euclidean).
+            metric = (
+                str(cfg.get("native_metric", "cosine")) if projection == "native"
+                else str(cfg.get("knn_metric", "euclidean"))
+            )
+            sample_size = cfg.get(
+                "silhouette_sample_size" if projection == "native" else "projection_silhouette_sample_size"
+            )
+            if sample_size is not None and proj.shape[0] > int(sample_size):
+                sil = metrics.silhouette_score(
+                    proj, np.asarray(target_full), metric=metric,
+                    sample_size=int(sample_size), random_state=int(cfg.get("seed", 42)) + run_idx,
+                )
+            else:
+                sil = metrics.silhouette_score(proj, np.asarray(target_full), metric=metric)
             all_sil_rows.append({
                 "dataset": dataset_name,
                 "projection": projection,
                 "model": encoder_name,
                 "run": run_idx,
                 "silhouette": float(sil),
+                "metric": metric,
+                "upsample_method": str(cfg.get("upsample_method", "pixelshuffle")),
             })
 
     if all_id_rows:
