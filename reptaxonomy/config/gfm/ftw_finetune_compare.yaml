@@ -1,0 +1,11 @@
+# FTW: pretrained vs fine-tuned (per EarthShift shift task; train on train, eval on id_test / ood_test).
+base: ftw_pretrained.yaml
+mode: finetune_compare
+root_dir: ./gfm_runs/ftw
+
+finetune:
+  modes: [linear, full]
+  epochs: 20
+  batch_size: 8
+  max_train_samples: 4000
+  runs: [ftw-germany-cambodia, ftw-south_africa-window, ftw-all-window]

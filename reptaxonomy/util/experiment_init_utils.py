@@ -8,22 +8,44 @@ from typing import Any, Callable, Dict, Optional, Type, List, Mapping, Sequence
 
 from torchvision.models._api import WeightsEnum
 
-from gfmtools.data.datasets.epa import EPALabels
-from gfmtools.data.datasets.hlsburnscars import HLSBurnScars
-from gfmtools.data.datasets.landfire import LandfireDataset
-from gfmtools.data.datasets.hlsburnscars_prealigned import  HLSBurnScarsPreAlignedEmbeddings
- 
-from gfmtools.models.resnet import ResNetEncoder
-from gfmtools.models.swin import SwinEncoder
-from gfmtools.models.dofa import DofaEncoder
-from gfmtools.models.croma import CROMAEncoder
-from gfmtools.models.precomputed_embeddings import PrecomputedEmbeddings
-from gfmtools.models.unet import unet
-from gfmtools.models.prithvi import (
-    PrithviEncoder,
-    PrithviEO1_Weights,
-    PrithviEO2_Weights,
-)
+_logger = logging.getLogger(__name__)
+
+
+def _optional_import(module: str, name: str):
+    """gfmtools releases differ in which datasets/models they ship (e.g. the
+    current release has no hlsburnscars_prealigned / precomputed_embeddings);
+    a missing optional class must not break every rep_taxonomy entry point."""
+    try:
+        mod = __import__(module, fromlist=[name])
+        return getattr(mod, name)
+    except Exception as exc:  # ImportError, missing optional deps
+        _logger.debug("optional import %s.%s unavailable: %s", module, name, exc)
+
+        class _Unavailable:  # placeholder keeps registries/type references valid
+            __name__ = name
+
+            def __init__(self, *a, **k):
+                raise ImportError(f"{module}.{name} is not available in this gfmtools install: {exc}")
+
+        _Unavailable.__name__ = name
+        return _Unavailable
+
+
+EPALabels = _optional_import("gfmtools.data.datasets.epa", "EPALabels")
+HLSBurnScars = _optional_import("gfmtools.data.datasets.hlsburnscars", "HLSBurnScars")
+LandfireDataset = _optional_import("gfmtools.data.datasets.landfire", "LandfireDataset")
+HLSBurnScarsPreAlignedEmbeddings = _optional_import(
+    "gfmtools.data.datasets.hlsburnscars_prealigned", "HLSBurnScarsPreAlignedEmbeddings")
+
+ResNetEncoder = _optional_import("gfmtools.models.resnet", "ResNetEncoder")
+SwinEncoder = _optional_import("gfmtools.models.swin", "SwinEncoder")
+DofaEncoder = _optional_import("gfmtools.models.dofa", "DofaEncoder")
+CROMAEncoder = _optional_import("gfmtools.models.croma", "CROMAEncoder")
+PrecomputedEmbeddings = _optional_import("gfmtools.models.precomputed_embeddings", "PrecomputedEmbeddings")
+unet = _optional_import("gfmtools.models.unet", "unet")
+PrithviEncoder = _optional_import("gfmtools.models.prithvi", "PrithviEncoder")
+PrithviEO1_Weights = _optional_import("gfmtools.models.prithvi", "PrithviEO1_Weights")
+PrithviEO2_Weights = _optional_import("gfmtools.models.prithvi", "PrithviEO2_Weights")
 
 from reptaxonomy.util.artifacts import ensure_dict
 
@@ -261,11 +283,20 @@ DATASET_REGISTRY = {
     "HLSBurnScarsPreAlignedEmbeddings": HLSBurnScarsPreAlignedEmbeddings,
 }
 
+# gfmtools representation sets (FTW / EPA-ecoregion / MADOS) -- see reptaxonomy.gfm
+try:
+    from reptaxonomy.gfm.datasets import REPSET_CLASSES as _GFM_REPSETS
+except Exception as _exc:  # pragma: no cover
+    _logger.debug("reptaxonomy.gfm datasets unavailable: %s", _exc)
+    _GFM_REPSETS = {}
+DATASET_REGISTRY.update(_GFM_REPSETS)
+
 DATASET_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "EPALabels": EPALabels,
     "HLSBurnScars": HLSBurnScars,
     "LandfireDataset": LandfireDataset,
     "HLSBurnScarsPreAlignedEmbeddings": HLSBurnScarsPreAlignedEmbeddings,
+    **_GFM_REPSETS,
 }
 
 # --- model aliases ---
@@ -306,6 +337,12 @@ MODEL_CLASS_REGISTRY: dict[str, Type[Any]] = {
     "PrithviEncoder": PrithviEncoder,
     "PrecomputedEmbeddings": PrecomputedEmbeddings,
 }
+
+try:
+    from reptaxonomy.gfm.encoders import GFMEncoder as _GFMEncoder
+    MODEL_CLASS_REGISTRY["GFMEncoder"] = _GFMEncoder
+except Exception as _exc:  # pragma: no cover
+    _logger.debug("reptaxonomy.gfm encoders unavailable: %s", _exc)
 
 
 
@@ -370,6 +407,10 @@ def default_loader_schema(
 
 
 def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
+    from reptaxonomy.gfm.registry import is_gfm_dataset_spec
+    if is_gfm_dataset_spec(spec):
+        from reptaxonomy.gfm.registry import build_gfm_dataset_bundle
+        return build_gfm_dataset_bundle(spec)
     dataset_name = spec.dataset_name or spec.name
     init = spec.init or {}
 
@@ -461,13 +502,14 @@ def build_dataset_bundle(spec: DatasetSpec) -> DatasetBundle:
         dataset_kwargs = {
             "data_root": spec.data_root or "/mnt/data/mtruong",
             "split": init.get("split", spec.split or "test"),
-            "split_file": init.get("split_file", "/home/rdemilt/sparkbenchmark/epa_splits.yml"),
+            "split_file": init.get("split_file", "/home/rdemilt/spark/benchmark/epa_splits.yml"),
             "regions": init.get("regions", None),
             "img_size": init.get("img_size", 128),
             "gsd": init.get("gsd", 30),
             "interpolation": init.get("interpolation", "bilinear"),
-            "included_time_points": init.get("included_time_points", 0),
-            "transform": init.get("transform", None),
+            # gfmtools.EPALabels: `included_timepoints` (the old `included_time_points`
+            # key and the `transform` argument no longer exist -> TypeError)
+            "included_timepoints": init.get("included_timepoints", init.get("included_time_points", (2, 3))),
             "sampling_algorithm": init.get("sampling_algorithm", None),
             "seed": init.get("seed", 1917),
             "sample_limit": init.get("sample_limit", 5000),
@@ -526,12 +568,16 @@ def resolve_model_spec(
     shared_model_init: Optional[Dict[str, Any]] = None,
     per_model_cfg: Optional[Dict[str, Any]] = None,
 ) -> ModelInitSpec:
-    if model_name not in MODEL_ALIASES:
+    alias_info = MODEL_ALIASES.get(model_name)
+    if alias_info is None:
+        # gfmtools catalog names: <arch>__<weights>, <arch>__scratch, <key>__ft__<tag>
+        from reptaxonomy.gfm.registry import gfm_model_alias
+        alias_info = gfm_model_alias(model_name)
+    if alias_info is None:
         raise ValueError(f"Unknown model alias: {model_name}")
     shared_model_init = shared_model_init or {}
     per_model_cfg = per_model_cfg or {}
     merged = merge_dicts(shared_model_init, per_model_cfg)
-    alias_info = MODEL_ALIASES[model_name]
     return ModelInitSpec(
         alias=model_name,
         family=alias_info["family"],
@@ -572,6 +618,10 @@ def infer_dofa_wavelengths(dataset_spec: DatasetSpec) -> Optional[Dict[str, Dict
 
 def build_model_bundle(model_spec: ModelInitSpec, dataset_bundle: DatasetBundle) -> ModelBundle:
     ds = dataset_bundle.dataset_spec
+
+    if model_spec.family == "gfm":
+        from reptaxonomy.gfm.registry import build_gfm_model_bundle
+        return build_gfm_model_bundle(model_spec, dataset_bundle)
 
     if model_spec.family == "resnet":
         model_cls = ResNetEncoder

@@ -1,0 +1,5 @@
+base: [ftw_finetune_compare.yaml, epa_finetune_compare.yaml, mados_finetune_compare.yaml]
+root_dir: ./gfm_runs/all
+mode: finetune_compare
+finetune:
+  epochs: 20

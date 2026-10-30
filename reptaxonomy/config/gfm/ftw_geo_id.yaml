@@ -1,0 +1,35 @@
+# Geolocated intrinsic dimension of image-encoder embeddings on FTW (official test split,
+# one condition per country, window A; pooled over countries for the spatial statistics).
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/ftw_geo_id.yaml
+# The same geo_id stage also runs inside ftw_pretrained.yaml / ftw_finetune_compare.yaml.
+base: base.yaml
+mode: pretrained
+root_dir: ./gfm_runs/ftw_geo_id
+stages: [prepare, embed, geo_id]
+embedding_backend: fast
+models:
+  suite: [resnet18__sentinel2_all_moco, resnet50__sentinel2_all_dino, swin_v2_t__sentinel2_si_ms_satlas,
+          dofa_base__dofa_mae, croma_base__croma_vit, prithvi_eo1__eo_1_0_100m, olmoearth_v1_nano,
+          unet__sentinel2_3class_ftw, resnet50__scratch]
+datasets:
+  ftw:
+    num_classes: 3
+    band_stats: {source: default}
+    data:
+      data_root: /mnt/data/ftw
+      reflectance_scale: 1.0
+      max_samples: 500
+    experiments:
+      - type: per_country
+        split: test
+        windows: [a]
+        countries: [austria, brazil, cambodia, denmark, france, germany, india, kenya, south_africa, vietnam]
+geo_id:
+  min_points: 20                 # per-country conditions can be small; pooled scope carries the spatial tests
+  ks_global: [10, 20]
+  ks_local: [10, 20]
+  global_estimators: [MLE, TwoNN, MOM, TLE, FisherS, CorrInt, ESS]
+  local_estimators: [MLE, TwoNN]
+  location_encoders:
+    geoinrid_root: /path/to/GeoINRID
+    models: [geoclip, csp_fmow, csp_inat]

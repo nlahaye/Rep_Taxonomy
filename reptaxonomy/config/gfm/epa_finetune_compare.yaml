@@ -1,0 +1,11 @@
+# EPA: fine-tune on the train ecoregions, evaluate per ecoregion (ID = train ecoregions, OOD = others).
+base: epa_pretrained.yaml
+mode: finetune_compare
+root_dir: ./gfm_runs/epa
+
+finetune:
+  modes: [linear, full]
+  epochs: 15
+  batch_size: 8
+  max_train_samples: 4000
+  max_eval_samples: 300

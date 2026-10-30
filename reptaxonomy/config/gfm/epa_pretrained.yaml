@@ -1,0 +1,20 @@
+# EPA / NLCD: one condition per EPA Level-III ecoregion (US_L3NAME); pairwise ecoregion shift.
+base: base.yaml
+mode: pretrained
+root_dir: ./gfm_runs/epa
+
+datasets:
+  epa:
+    num_classes: 16                      # NLCD level 2 (nlcd_level: 1 -> 8 classes)
+    band_stats: {source: compute, reference: epa__split-train, n_samples: 512}
+    data:
+      data_root: /mnt/data/mtruong/
+      split_file: /mnt/data/mtruong/epa_splits.yaml   # train/val/test lists of ecoregions (fix path)
+      instrument: S2L2A                  # S2L2A (12 bands) | L8 (6 bands, 30 m)
+      included_timepoints: [2, 3]        # NB: gfmtools key is included_timepoints
+      timepoint: -1                      # which of the included timepoints is embedded
+      nlcd_level: 2
+      max_samples: 300
+    experiments:
+      - {type: ecoregions, regions: all}           # or a list of US_L3NAME, or "split:test"
+      - {type: splits, splits: [train, val, test]} # region-disjoint splits as conditions

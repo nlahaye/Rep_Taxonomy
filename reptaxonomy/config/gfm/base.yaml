@@ -1,0 +1,159 @@
+# Shared settings for reptaxonomy.pipelines.gfm_experiment (inherited via `base: base.yaml`).
+# Every path is relative to root_dir unless set explicitly.
+root_dir: ./gfm_runs
+device: null                    # null -> cuda if available
+seed: 42
+num_workers: 4
+log_level: INFO
+fail_fast: false
+
+# reptaxonomy -> pipelines.generate_embeddings.run_embedding_export (batch 1, reference path)
+# fast        -> batched GFMEncoder export (identical embd_<stem>.npy artifacts)
+embedding_backend: reptaxonomy
+embed_batch_size: 16
+overwrite_embeddings: false
+overwrite_cache: false
+label_grid: 64                  # label caches are nearest-downsampled to <= 64 x 64
+
+# Models whose band plan covers < min_band_coverage of their pre-training bands are
+# skipped for that dataset (logged in work/model_coverage.csv). Coverage itself is a
+# covariate worth reporting: FTW (R,G,B,NIR) covers only ~30-40 % of 12/13-band S2 models.
+min_band_coverage: 0.25
+
+models:
+  suite: core                   # core | optical | full | explicit list of catalog keys
+  include_experimental: false   # OlmoEarth v1.1/v1.2 etc.
+  include_scratch: true         # <arch>__scratch random-init controls (training deltas)
+  include: []
+  exclude: []
+
+model_init:
+  pretrained: true
+  normalization: dataset_zscore # dataset_zscore | none (OlmoEarth always uses its own normaliser)
+  fill: zero                    # missing pre-training bands: zero (= dataset mean after z-score) | mean
+  time_index: -1
+
+per_model_overrides: {}         # e.g. {scalemae_large__fmow_rgb: {input_size: 224}}
+
+cross_condition:
+  enabled: true
+  n_perm: 200
+  pca_dim: 64
+  max_tokens_per_chip: 64
+  figure_formats: [png, pdf]
+
+# Geolocated intrinsic dimension (GeoINRID-style; reptaxonomy.robustness.geo_intrinsic_dimension).
+# Uses chip-centre lat/lon stored in work/manifests/<cond>.json by the prepare stage.
+geo_id:
+  enabled: true
+  finetuned: true               # ft_geo_id: pretrained vs fine-tuned local-ID maps on each run's eval conditions
+  unit: chip                    # chip = mean-pooled chip embedding | token = token cloud, LID median per chip
+  max_tokens_per_chip: 16
+  global_estimators: [MLE, TwoNN, MOM, TLE, FisherS, CorrInt, DANCo, ESS]
+  ks_global: [10, 20, 100]
+  local_estimators: [MLE, TwoNN, TLE]
+  ks_local: [20, 50]
+  smooth: true
+  n_runs: 3                     # seeded subsamples for global-ID variability
+  max_points: 5000
+  slow_max_points: 1000         # ESS / DANCo / MiND are evaluated on <= this many points
+  min_points: 50                # conditions with fewer geolocated chips are skipped
+  moran_k: 8                    # haversine kNN weights for Moran's I
+  n_perm: 499
+  density_k: 8                  # sampling-density control (distance to k-th geographic neighbour)
+  knn_jaccard_k: 10
+  mantel_max: 1500
+  pool: true                    # also analyse all geolocated chips of a family together
+  per_condition: true
+  map_method: MLE
+  # Location-only references at the same sites (GeoINRID weights; SatCLIP needs microsoft/satclip + ckpt)
+  location_encoders: {}
+  #   geoinrid_root: /path/to/GeoINRID
+  #   models: [geoclip, csp_fmow, csp_inat]
+  #   # models: {satclip_l10: {satclip_repo: /path/to/satclip, checkpoint: /path/satclip-resnet18-l10.ckpt}}
+  datasets: {}                  # per-family overrides, e.g. {mados: {min_points: 30}}
+
+synthesis: {}                   # extra keys for the pooled per-family synthesis
+
+# Template for reptaxonomy.pipelines.full_pipeline (dataset / models are filled per condition).
+pipeline:
+  n_runs: 3
+  projections: [native, umap, tsne, pca]
+  upsample_methods: [pixelshuffle, nearest, bilinear]
+  knn_metric: euclidean
+  knn_k: null
+  native_normalization: l2
+  native_metric: cosine
+  silhouette_sample_size: 20000
+  projection_silhouette_sample_size: null
+  analysis: {}
+  steps:
+    compute_resource_reqs:
+      enabled: true
+      config_overrides:
+        measure_compression_energy: false
+        measure_inference_energy: false
+        test_batch_size: 1
+    weight_matrix_analysis: {enabled: true, config_overrides: {}}
+    run_projections:
+      enabled: true
+      config_overrides:
+        # pixels sampled PER CLASS PER CHIP; total points ~ chips x classes x this.
+        # Keep the total <~ 15-20k: data_kernel_analysis builds an omnibus graph over all models.
+        label_file_subset: 10
+        build_knn: true
+        umap_n_neighbors: 15
+        umap_min_dist: 0.1
+        umap_n_components: 2
+        umap_spread: 1.0
+        tsne_n_jobs: 8
+        pca_max_components: 64
+    embedding_robustness:
+      enabled: true
+      config_overrides:
+        id_methods: [MLE, TwoNN, TLE, DANCo, FisherS, MOM, CorrInt, ESS, MiND_ML, MiND_KL, MADA]
+        id_k_values: [5, 10, 20]
+        max_id_samples: 20000
+    data_kernel_analysis: {enabled: true, config_overrides: {pvalue_plus_one: false}}
+    reference_similarity:
+      enabled: true
+      config_overrides: {cka_max_samples: 20000, cka_debiased_samples: 0, cka_native_raw: true}
+    invariance_checks:
+      enabled: true
+      config_overrides:
+        invariance_run: 0
+        invariance_n_samples: 2000
+        invariance_lenses: [native, pca]
+        invariance_pairs: null
+    geodesic_compare: {enabled: true, config_overrides: {representation: geo_euc}}
+    demsar_wrapper: {enabled: true, config_overrides: {alpha: 0.05}}
+    cross_perspective_synthesis:
+      enabled: true
+      config_overrides:
+        synthesis:
+          robustness_rank_by: mean
+          layer_fit_rank_by: frac_in_range
+          compute_rank_by: gflops
+          emissions_rank_by: kg_co2eq_per_sample
+          mantel_permutations: 10000
+          primary_lens: native
+          reference_metrics: [linear_cka, knn_jaccard]
+
+# Used only in mode: finetune_compare
+finetune:
+  modes: [linear, full]         # linear = frozen pretrained probe (always run); + full | partial
+  head: fcn                     # fcn | progressive | linear
+  epochs: 20
+  batch_size: 8
+  lr: 1.0e-4
+  backbone_lr_mult: 0.1
+  weight_decay: 0.05
+  unfreeze_fraction: 0.25       # partial mode: last fraction of backbone parameter tensors
+  max_train_samples: null
+  max_eval_samples: null
+  early_stop_patience: 5
+  amp: true
+  weight_change: true
+  models: null                  # null -> every model used for the dataset; or a list (>= 2: pre+ft pipeline needs >= 3 models)
+  runs: null                    # null -> every FT run built from the experiments; or list of tags
+  per_family: {}                # e.g. {olmoearth: {full: {lr: 5.0e-5}}}

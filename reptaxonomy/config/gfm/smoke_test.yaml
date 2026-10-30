@@ -1,0 +1,23 @@
+# Fast CPU smoke test (tiny subsample, scratch + 2 small pretrained models, cheap steps only).
+base: mados_pretrained.yaml
+root_dir: /tmp/gfm_smoke
+num_workers: 0
+embedding_backend: reptaxonomy
+models: {suite: [resnet50__scratch, dofa_base__scratch, resnet18__sentinel2_all_moco]}
+datasets:
+  mados:
+    data: {max_samples: 6}
+cross_condition: {n_perm: 20, pca_dim: 8, figure_formats: [png]}
+pipeline:
+  n_runs: 1
+  projections: [native, pca]
+  upsample_methods: [pixelshuffle]
+  steps:
+    run_projections: {enabled: true, config_overrides: {label_file_subset: 10, tsne_n_jobs: 1}}
+    compute_resource_reqs: {enabled: false}
+    weight_matrix_analysis: {enabled: false}
+    embedding_robustness: {enabled: false}
+    invariance_checks: {enabled: false}
+    geodesic_compare: {enabled: false}
+    demsar_wrapper: {enabled: false}
+finetune: {modes: [linear, full], epochs: 1, batch_size: 2, amp: false}

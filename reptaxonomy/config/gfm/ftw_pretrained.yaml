@@ -1,0 +1,39 @@
+# Fields of the World: pretrained-only representation evaluation across splits / countries / seasons.
+base: base.yaml
+mode: pretrained
+root_dir: ./gfm_runs/ftw
+
+datasets:
+  ftw:
+    num_classes: 3                       # background / field / boundary (3 = unknown -> ignore)
+    band_stats: {source: default}        # EarthShift FTW statistics (fixed across conditions)
+    data:
+      data_root: /mnt/data/ftw
+      reflectance_scale: 1.0             # raw DN; band stats are scaled accordingly
+      max_samples: 500                   # chips per condition (hash-stable subsample)
+    experiments:
+      # (1) EarthShift shift tasks: train / id_test / ood_test become three conditions;
+      #     comparisons: train~id_test (reference), train~ood_test and id_test~ood_test (shift)
+      - {type: shift_task, tasks: table1, splits: [train, id_test, ood_test]}
+      # (1b) custom ftw_shifts tasks (geographic_shift / seasonal_shift), same split structure
+      - type: shift_task
+        splits: [train, id_test, ood_test]
+        tasks:
+          - {kind: geographic, name: ftw-europe-africa, id_countries: [austria, belgium, france, germany],
+             ood_countries: [kenya, rwanda, south_africa]}
+          - {kind: geographic, name: ftw-europe-asia, id_countries: [austria, belgium, france, germany],
+             ood_countries: [cambodia, india, vietnam]}
+          - {kind: seasonal, name: ftw-france-window, countries: [france], id_window: a, ood_window: b}
+      # (2) the ftw-all-window OOD split broken down by country (which countries move most?)
+      - type: shift_by_country
+        task: ftw-all-window
+        split: ood_test
+        countries: [austria, belgium, france, germany, india, kenya, rwanda, south_africa, vietnam]
+      # (3) one condition per country on the official test split (geographic taxonomy)
+      - type: per_country
+        split: test
+        countries: [austria, brazil, cambodia, denmark, france, germany, india, kenya, south_africa, vietnam]
+      # (4) paired seasonal shift: window A vs window B of the SAME chips -> paired CKA / retrieval
+      - type: seasonal_paired
+        split: test
+        countries: [france, germany, kenya, south_africa, vietnam]

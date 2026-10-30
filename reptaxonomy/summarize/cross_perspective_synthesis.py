@@ -704,7 +704,12 @@ def run_cross_perspective_synthesis(cfg: Dict[str, Any]) -> Dict[str, Any]:
     models = [str(m) for m in model_names_cfg]
     datasets = syn["datasets"]
 
-    tag = datasets[0] if len(datasets) == 1 else "_".join(datasets)
+    # synthesis.tag overrides the output folder name (needed when many datasets /
+    # conditions are pooled, e.g. dozens of EPA ecoregions -> filename too long).
+    tag = syn.get("tag") or (datasets[0] if len(datasets) == 1 else "_".join(datasets))
+    if len(tag) > 120:
+        import hashlib
+        tag = f"{len(datasets)}ds_" + hashlib.sha1(tag.encode()).hexdigest()[:10]
     out = ensure_dir(os.path.join(out_dir, syn["out_subdir"], tag))
     logger.info("Cross-perspective synthesis datasets=%s models=%s -> %s", datasets, models, out)
 

@@ -1,0 +1,14 @@
+# MADOS (marine debris / oil spill): train / val / test splits as conditions.
+base: base.yaml
+mode: pretrained
+root_dir: ./gfm_runs/mados
+
+datasets:
+  mados:
+    num_classes: 15                      # MADOS classes 1..15 -> 0..14 (0 = unlabeled -> ignore)
+    band_stats: {source: compute, reference: mados__train, n_samples: 512}
+    data:
+      data_root: /mnt/data/rdemilt/mados/MADOS
+      max_samples: null
+    experiments:
+      - {type: splits, splits: [train, val, test]}

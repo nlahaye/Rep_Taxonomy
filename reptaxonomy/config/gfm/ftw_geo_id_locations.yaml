@@ -1,0 +1,29 @@
+# Location-only geolocated ID over the full FTW footprint and the ftw_shifts ID / OOD site sets.
+# Sites: python scripts/ftw_geo_subset.py --root <dir> --countries all --footprints-only
+name: ftw_locations
+sites_csv: /mnt/data/ftw_geo/ftw_chip_sites.csv
+out_dir: ./gfm_runs/ftw/outputs
+scopes:
+  all: {}
+  by: [country]
+  ftw_shift_tasks:
+    - earthshift                         # all EarthShift FTW recipes (geographic -> __id/__ood, seasonal -> __sites)
+    - {kind: geographic, name: ftw-europe-africa, id_countries: [austria, belgium, france, germany],
+       ood_countries: [kenya, rwanda, south_africa]}
+    - {kind: geographic, name: ftw-europe-asia, id_countries: [austria, belgium, france, germany],
+       ood_countries: [cambodia, india, vietnam]}
+geo_id:
+  global_estimators: [MLE, TwoNN, MOM, TLE, FisherS, CorrInt]   # add ESS / DANCo on GPU nodes
+  ks_global: [10, 20, 100]
+  local_estimators: [MLE, TwoNN]
+  ks_local: [20, 50]
+  n_runs: 3
+  max_points: 5000
+  min_points: 30
+  n_perm: 499
+  group_keys: [country, split]
+  location_encoders:
+    geoinrid_root: /path/to/GeoINRID
+    models: [geoclip, csp_fmow, csp_inat]
+# ID estimates depend on n: compare each OOD site set with n_rep same-size random subsets of its ID set
+size_matched: {n_rep: 50, k: 10}

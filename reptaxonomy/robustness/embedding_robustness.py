@@ -24,7 +24,8 @@ def get_model_name(cfg: Dict[str, Any]) -> str:
 
 def get_id_estimators():
     return {
-        "MLE": lambda k: skdim.id.MLE(neighborhood_based=True, n_neighbors=k),
+        # skdim >= 0.3 takes n_neighbors in fit(), not the constructor (see estimate_id)
+        "MLE": lambda k: skdim.id.MLE(neighborhood_based=True),
         "TwoNN": lambda k: skdim.id.TwoNN(),
         "FisherS": lambda k: skdim.id.FisherS(project_on_sphere=False),
         "MOM": lambda k: skdim.id.MOM(),
@@ -44,7 +45,10 @@ def estimate_id(embed: np.ndarray, methods: List[str], k_values: List[int]) -> L
         for k in k_values:
             try:
                 estimator = estimators[method](k)
-                estimator.fit(embed)
+                if method == "MLE":
+                    estimator.fit(embed, n_neighbors=k)
+                else:
+                    estimator.fit(embed)
                 if hasattr(estimator, "dimension_"):
                     val = float(estimator.dimension_)
                 elif hasattr(estimator, "dimension_pw_"):

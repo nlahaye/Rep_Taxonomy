@@ -1,0 +1,4 @@
+# All three datasets in one run (separate per-dataset outputs; shared embedding cache).
+base: [ftw_pretrained.yaml, epa_pretrained.yaml, mados_pretrained.yaml]
+root_dir: ./gfm_runs/all
+mode: pretrained

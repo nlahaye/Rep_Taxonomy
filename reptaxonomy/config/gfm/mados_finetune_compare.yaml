@@ -1,0 +1,8 @@
+base: mados_pretrained.yaml
+mode: finetune_compare
+root_dir: ./gfm_runs/mados
+
+finetune:
+  modes: [linear, full]
+  epochs: 30
+  batch_size: 8
