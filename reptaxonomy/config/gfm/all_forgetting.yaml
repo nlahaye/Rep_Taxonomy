@@ -1,0 +1,22 @@
+# Catastrophic forgetting across FTW / EPA / MADOS: fine-tune every model with several
+# update regimes, then measure what the update removed on retention sets.
+base: all_finetune_compare.yaml
+root_dir: ./gfm_runs/all_forgetting
+mode: finetune_compare
+finetune:
+  modes: [linear, full, lpft, l2sp, lora, full_lr3x]
+  variants:
+    lpft: {mode: lpft}
+    l2sp: {mode: full, regularizer: l2sp, reg_weight: 1.0e-3}
+    lora: {mode: lora, lora_rank: 8, lora_alpha: 16}
+    full_lr3x: {mode: full, lr: 3.0e-4}
+  wise_ft: {enabled: true, source_variant: full, alphas: [0.25, 0.5, 0.75]}
+forgetting:
+  retention: {same_family: true, cross_family: true, include_ood: false, max_per_family: 3}
+  layerwise: {enabled: true, max_retention: 2}
+  geo_id: true
+  sequential:
+    - {name: ftw_then_mados, steps: ["ftw:ftw-europe-asia", "mados:mados-train"], mode: full}
+    - {name: ftw_then_mados_ewc, steps: ["ftw:ftw-europe-asia", "mados:mados-train"], mode: full,
+       regularizer: ewc, reg_weight: 100.0}
+    - {name: ftw_then_epa, steps: ["ftw:ftw-europe-asia", "epa:epa-train"], mode: full}

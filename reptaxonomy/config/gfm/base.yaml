@@ -157,3 +157,35 @@ finetune:
   models: null                  # null -> every model used for the dataset; or a list (>= 2: pre+ft pipeline needs >= 3 models)
   runs: null                    # null -> every FT run built from the experiments; or list of tags
   per_family: {}                # e.g. {olmoearth: {full: {lr: 5.0e-5}}}
+  # Named variants usable in ``modes`` (base mode + extra run_finetune arguments), e.g.
+  #   lpft: {mode: lpft}                                   (head from the linear run)
+  #   l2sp: {mode: full, regularizer: l2sp, reg_weight: 1.0e-3}
+  #   lora: {mode: lora, lora_rank: 8}
+  #   full_lr3x: {mode: full, lr: 3.0e-4}                  (larger update -> more forgetting?)
+  variants: {}
+  wise_ft:                      # WiSE-FT interpolation linear <-> source_variant (stage ft_wise)
+    enabled: false
+    source_variant: full
+    alphas: [0.25, 0.5, 0.75]   # -> variants wise025 / wise050 / wise075
+
+# Catastrophic forgetting (stages forgetting, ft_sequential; mode finetune_compare)
+forgetting:
+  enabled: true
+  retention:
+    same_family: true           # analysed conditions of the FT family outside the run (FTW: held-out countries)
+    cross_family: true          # analysed conditions of the other enabled families
+    include_ood: false          # also the run's own OOD conditions (relation = ood; transfer, not retention)
+    max_per_family: 3
+    prefer_roles: [test, country, region, id_region, id_test, season]
+    families: null              # restrict cross-family retention to these families
+    explicit: {}                # {run_tag: ["ftw:ftw__country-kenya__test", "mados:mados__test"]}
+  probes: [knn, linear]
+  probe_k: 10
+  n_splits: 3
+  max_tokens_per_chip: 64
+  layerwise: {enabled: true, max_retention: 2, max_chips: 64, batch_size: 8, grid: 4, max_depths: 8}
+  geo_id: false                 # geolocated ID on the retention sets (pre vs ft), tag <family>_retention_<family>
+  predictor_csvs: []            # extra per-model predictor tables (column ``model``) for correlations.csv
+  sequential: []                # e.g. [{name: ftw_then_mados, steps: ["ftw:ftw-germany-cambodia", "mados:mados-train"],
+                                #        mode: full, regularizer: null|ewc|l2sp, reg_weight: 0.0, models: null}]
+  figure_formats: [png, pdf]

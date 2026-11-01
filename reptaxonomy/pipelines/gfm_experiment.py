@@ -43,6 +43,18 @@ Two modes (``mode:`` in the YAML, or ``--mode``):
     * ft_geo_id: geo_id on each run's eval conditions for pretrained + fine-tuned
       models (local-ID maps before/after adaptation; outputs/geo_id/<ds>_<tag>_ft).
 
+Catastrophic forgetting (see ``reptaxonomy.gfm.forgetting``)
+
+    * finetune variants: ``finetune.modes`` may list ``lpft`` / ``lora`` or named
+      ``finetune.variants`` (e.g. ``l2sp: {mode: full, regularizer: l2sp, reg_weight: 1e-3}``).
+    * ft_wise: WiSE-FT weight-space interpolation between the linear-probe run and
+      ``finetune.wise_ft.source_variant`` at ``alphas`` (variants ``wise025`` ...).
+    * forgetting: representation forgetting of every fine-tuned variant on retention
+      sets (same-family conditions outside the run, conditions of the other
+      families), layer-wise CKA, learning-forgetting trade-off; retention-set geo_id.
+    * ft_sequential: sequential fine-tuning chains (``forgetting.sequential``) with
+      accuracy matrix / BWT, optionally EWC or L2-SP.
+
 Usage::
 
     python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/ftw_pretrained.yaml
@@ -89,7 +101,10 @@ from reptaxonomy.robustness.geo_intrinsic_dimension import run_geo_id
 logger = logging.getLogger("reptaxonomy.gfm_experiment")
 
 PRETRAINED_STAGES = ["prepare", "embed", "pipeline", "cross_condition", "geo_id", "synthesis"]
-FINETUNE_STAGES = ["finetune", "ft_embed", "ft_pipeline", "finetune_compare", "ft_geo_id", "ft_synthesis"]
+FINETUNE_STAGES = ["finetune", "ft_wise", "ft_embed", "ft_pipeline", "finetune_compare", "ft_geo_id", "ft_synthesis"]
+# run after the per-family loop (they need every family's conditions / outputs)
+POST_STAGES = ["forgetting", "ft_sequential"]
+BASE_MODES = ("linear", "partial", "full", "lpft", "lora")
 REPSET_INFO = {"FTWRepSet": ("s2", 10.0), "EPARepSet": ("s2", 10.0), "MADOSRepSet": ("s2", 10.0)}
 
 
@@ -465,11 +480,37 @@ def family_synthesis(ctx: DatasetContext, cond_names: List[str], models: List[st
 
 
 # ----------------------------------------------------------------------------- fine-tuning
-def ft_modes(cfg: Dict[str, Any]) -> List[str]:
+def wise_names(cfg: Dict[str, Any]) -> List[str]:
+    w = ((cfg.get("finetune", {}) or {}).get("wise_ft", {}) or {})
+    if not w.get("enabled", False):
+        return []
+    return [f"wise{int(round(float(a) * 100)):03d}" for a in w.get("alphas", [0.5]) if 0 < float(a) < 1]
+
+
+def ft_modes(cfg: Dict[str, Any], include_wise: bool = True) -> List[str]:
+    """Variant labels: base modes, named ``finetune.variants`` and (optionally) WiSE-FT."""
     modes = list((cfg.get("finetune", {}) or {}).get("modes", ["linear", "full"]))
     if "linear" not in modes:
         modes = ["linear"] + modes  # linear probe on the frozen backbone = pretrained reference
+    if include_wise:
+        modes += [w for w in wise_names(cfg) if w not in modes]
     return modes
+
+
+def variant_spec(cfg: Dict[str, Any], name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """(base mode, extra hyper-parameters) of a variant label; None for derived (WiSE) variants."""
+    variants = ((cfg.get("finetune", {}) or {}).get("variants", {}) or {})
+    if name in variants:
+        v = dict(variants[name] or {})
+        mode = v.pop("mode", "full")
+        if mode not in BASE_MODES:
+            raise ValueError(f"finetune.variants.{name}.mode={mode!r} not in {BASE_MODES}")
+        return mode, v
+    if name in BASE_MODES:
+        return name, {}
+    if name.startswith("wise"):
+        return None
+    raise ValueError(f"Unknown fine-tuning mode/variant '{name}' (base modes {BASE_MODES} or finetune.variants)")
 
 
 def ft_models(ctx: DatasetContext, cfg: Dict[str, Any]) -> List[str]:
@@ -491,23 +532,69 @@ def run_finetunes(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -
                  if c in ctx.by_name}
         for m in ft_models(ctx, cfg):
             fam = get_entry(m)["family"]
-            for mode in ft_modes(cfg):
+            # linear first: LP-FT initialises its head from the linear run
+            for name in sorted(ft_modes(cfg, include_wise=False), key=lambda v: v != "linear"):
+                spec = variant_spec(cfg, name)
+                if spec is None:
+                    continue
+                mode, extra = spec
                 h = deep_merge(hp, (per_family.get(fam, {}) or {}).get(mode, per_family.get(fam, {}) or {}))
                 h = {k: v for k, v in h.items() if not isinstance(v, dict)}
-                out = Path(P["finetune_root"], ctx.name, r.tag, m, mode)
-                logger.info("[FT] %s %s %s -> %s", r.tag, m, mode, out)
+                h.update({k: v for k, v in extra.items() if not isinstance(v, dict)})
+                if mode == "lpft":
+                    h.setdefault("lp_head_from", str(Path(P["finetune_root"], ctx.name, r.tag, m, "linear", "model.pt")))
+                out = Path(P["finetune_root"], ctx.name, r.tag, m, name)
+                logger.info("[FT] %s %s %s (%s) -> %s", r.tag, m, name, mode, out)
                 try:
                     run_finetune(m, ctx.encoder_kwargs(m, cfg), {"cls": r.train.cls, "kwargs": r.train.kwargs},
                                  {"cls": r.val.cls, "kwargs": r.val.kwargs} if r.val else None, evals,
                                  ctx.num_classes, out, mode=mode, num_workers=int(cfg.get("num_workers", 0)),
                                  device=cfg.get("device"), seed=int(cfg.get("seed", 0)),
-                                 overwrite=bool(fc.get("overwrite", False)), **h)
+                                 overwrite=bool(fc.get("overwrite", False)), variant=name, **h)
                 except Exception:
-                    logger.error("[FT] %s %s %s failed\n%s", r.tag, m, mode, traceback.format_exc())
+                    logger.error("[FT] %s %s %s failed\n%s", r.tag, m, name, traceback.format_exc())
                     if cfg.get("fail_fast"):
                         raise
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+
+def run_wise(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> None:
+    """WiSE-FT checkpoints + metrics for every (run, model): linear run <-> source variant."""
+    from reptaxonomy.gfm.finetune import evaluate_checkpoint, wise_interpolate
+    fc = dict(cfg.get("finetune", {}) or {})
+    w = dict(fc.get("wise_ft", {}) or {})
+    src = str(w.get("source_variant", "full"))
+    for r in ctx.runs:
+        if fc.get("runs") and r.tag not in fc["runs"]:
+            continue
+        evals = {c: {"cls": ctx.by_name[c].cls, "kwargs": ctx.by_name[c].kwargs} for c in r.eval_conditions
+                 if c in ctx.by_name}
+        for m in ft_models(ctx, cfg):
+            base = Path(P["finetune_root"], ctx.name, r.tag, m)
+            lin, ft = base / "linear" / "model.pt", base / src / "model.pt"
+            if not (lin.exists() and ft.exists()):
+                logger.warning("[WISE] %s %s: need linear and %s checkpoints", r.tag, m, src)
+                continue
+            for a in w.get("alphas", [0.5]):
+                a = float(a)
+                if not 0 < a < 1:
+                    continue
+                name = f"wise{int(round(a * 100)):03d}"
+                out = base / name
+                if (out / "metrics.json").exists() and not fc.get("overwrite", False):
+                    continue
+                try:
+                    ck = wise_interpolate(lin, ft, a, out / "model.pt")
+                    res = evaluate_checkpoint(m, ctx.encoder_kwargs(m, cfg), ck, evals, ctx.num_classes,
+                                              batch_size=int(fc.get("batch_size", 8)),
+                                              num_workers=int(cfg.get("num_workers", 0)),
+                                              max_eval_samples=fc.get("max_eval_samples"), device=cfg.get("device"))
+                    res.update(mode=name, variant=name, wise_alpha=a, wise_source=src, head=fc.get("head", "fcn"))
+                    (out / "metrics.json").write_text(json.dumps(res, indent=2))
+                    logger.info("[WISE] %s %s alpha=%.2f done", r.tag, m, a)
+                except Exception:
+                    logger.error("[WISE] %s %s %s failed\n%s", r.tag, m, name, traceback.format_exc())
 
 
 def ft_variants(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str], run) -> Tuple[List[str], Dict[str, Dict[str, Any]], List[List[str]]]:
@@ -527,12 +614,198 @@ def ft_variants(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str], run
     return names, ov, pairs
 
 
+# ----------------------------------------------------------------------------- helpers
+def _spec(c: Condition) -> Dict[str, Any]:
+    return {"cls": c.cls, "kwargs": dict(c.kwargs)}
+
+
+# ----------------------------------------------------------------------------- forgetting
+_FTW_COUNTRIES = {"austria", "belgium", "brazil", "cambodia", "corsica", "croatia", "denmark", "estonia", "finland",
+                  "france", "germany", "india", "kenya", "latvia", "lithuania", "luxembourg", "netherlands",
+                  "portugal", "rwanda", "slovakia", "slovenia", "south_africa", "spain", "sweden", "vietnam"}
+
+
+def _ftw_task_countries(cond: Condition) -> Tuple[Optional[set], set]:
+    """(train countries | None = all, ood countries) of an FTW shift-task condition."""
+    spec = cond.kwargs.get("shift_spec") or {}
+    if spec:
+        tr = set(spec.get("id_countries") or spec.get("countries") or [])
+        return (tr or None), set(spec.get("ood_countries") or [])
+    task = str(cond.kwargs.get("shift_task") or cond.tags.get("task") or "")
+    toks = task.replace("ftw-", "", 1).replace("south-africa", "south_africa").split("-")
+    if "all" in toks:
+        return None, set()
+    found = [t for t in toks if t in _FTW_COUNTRIES]
+    if not found:
+        return None, set()
+    return {found[0]}, set(found[1:])
+
+
+def retention_conditions(ctxs: Dict[str, DatasetContext], ctx: DatasetContext, run, m: str,
+                         fc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Retention sets for (family, run, base model): same-family, cross-family, optional OOD."""
+    rc = dict(fc.get("retention", {}) or {})
+    explicit = (rc.get("explicit", {}) or {}).get(run.tag)
+    kmax = int(rc.get("max_per_family", 3))
+    used = set(run.eval_conditions) | {run.train.name} | ({run.val.name} if run.val else set())
+    out: List[Dict[str, Any]] = []
+
+    def add(g: DatasetContext, cname: str, rel: str) -> None:
+        if cname in g.by_name and g.by_name[cname].analyze and m in g.models:
+            out.append({"condition": cname, "family": g.name, "relation": rel})
+
+    if explicit:
+        for e in explicit:
+            fam, cname = e.split(":", 1) if ":" in e else (ctx.name, e)
+            if fam in ctxs:
+                add(ctxs[fam], cname, "same_family" if fam == ctx.name else "cross_family")
+        return out
+    if rc.get("same_family", True):
+        tr_c, ood_c = (_ftw_task_countries(run.train) if ctx.name == "ftw" else (set(), set()))
+        cands = []
+        for c in ctx.analysed:
+            if c.name in used or c.tags.get("in_train_split") or c.role in ("train", "val"):
+                continue
+            if ctx.name == "ftw":
+                if tr_c is None:
+                    continue  # run trains on every country -> nothing is held out
+                ctry = c.tags.get("country")
+                if ctry is None or ctry in tr_c or (ctry in ood_c and not rc.get("include_ood", False)):
+                    continue
+                if c.cls == "FTWRepSet" and c.kwargs.get("shift_task"):
+                    continue  # prefer official-test country conditions over shift-task splits
+            cands.append(c.name)
+        for cname in sorted(cands)[:kmax]:
+            add(ctx, cname, "same_family")
+    if rc.get("cross_family", True):
+        pref = list(rc.get("prefer_roles", ["test", "country", "region", "id_region", "id_test", "season"]))
+        for g in ctxs.values():
+            if g.name == ctx.name or (rc.get("families") and g.name not in rc["families"]):
+                continue
+            cands = sorted(g.analysed, key=lambda c: (pref.index(c.role) if c.role in pref else len(pref), c.name))
+            cands = [c for c in cands if c.role not in ("train", "val")] or cands
+            for c in cands[:kmax]:
+                add(g, c.name, "cross_family")
+    if rc.get("include_ood", False):
+        for cname in run.ood_conditions:
+            add(ctx, cname, "ood")
+    return out
+
+
+def _predictors(cfg: Dict[str, Any], P: Dict[str, str], family: str) -> Optional["pd.DataFrame"]:
+    import pandas as pd
+    frames = []
+    for extra in (cfg.get("forgetting", {}) or {}).get("predictor_csvs", []) or []:
+        if Path(extra).exists():
+            frames.append(pd.read_csv(extra))
+    if not frames:
+        return None
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.merge(f, on="model", how="outer")
+    return out
+
+
+def forgetting_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str],
+                     base_ov: Dict[str, Dict[str, Any]]) -> None:
+    from reptaxonomy.gfm.forgetting import run_forgetting
+    fc = dict(cfg.get("forgetting", {}) or {})
+    if not fc.get("enabled", True):
+        return
+    lw_max = int((fc.get("layerwise", {}) or {}).get("max_retention", 2))
+    gcfg = dict(cfg.get("geo_id", {}) or {})
+    for name, ctx in ctxs.items():
+        if fc.get("families") and name not in fc["families"]:
+            continue
+        jobs = []
+        for r in ctx.runs:
+            if (cfg.get("finetune", {}) or {}).get("runs") and r.tag not in cfg["finetune"]["runs"]:
+                continue
+            ft_names, ft_ov, pairs = ft_variants(ctx, cfg, P, r)
+            for pre, ftn in pairs:
+                variant = ftn.rsplit(f"{r.tag}-", 1)[1]
+                ret = retention_conditions(ctxs, ctx, r, pre, fc)
+                if not ret:
+                    continue
+                for k, e in enumerate(ret):
+                    g = ctxs[e["family"]]
+                    cond = g.by_name[e["condition"]]
+                    ov = dict(base_ov, **{ftn: dict(ft_ov[ftn])})
+                    embed_condition(g, cond, [pre, ftn], cfg, P, ov)  # pre is a no-op when cached
+                    e.update(spec=_spec(cond), pre_kwargs=g.encoder_kwargs(pre, cfg), layerwise=k < lw_max)
+                jobs.append({"run": r.tag, "model": pre, "variant": variant, "ft_name": ftn,
+                             "id_conditions": r.id_conditions or r.eval_conditions, "ood_conditions": r.ood_conditions,
+                             "ft_ckpt": ft_ov[ftn]["checkpoint"], "retention": ret})
+        if not jobs:
+            logger.info("[FORGET] %s: no fine-tuned variants with retention sets", name)
+            continue
+        params = {k: v for k, v in fc.items() if k not in ("enabled", "retention", "sequential", "families",
+                                                           "predictor_csvs", "geo_id")}
+        logger.info("[FORGET] %s: %d jobs", name, len(jobs))
+        run_forgetting(name, jobs, P["embed_dir"], P["work_dir"], P["out_dir"], P["finetune_root"], params,
+                       seed=int(cfg.get("seed", 0)), device=cfg.get("device"), predictors=_predictors(cfg, P, name))
+        if fc.get("geo_id", False) and gcfg.get("enabled", True):
+            by_fam: Dict[str, Dict[str, set]] = {}
+            for j in jobs:
+                for e in j["retention"]:
+                    d = by_fam.setdefault(e["family"], {"conds": set(), "models": set()})
+                    d["conds"].add(e["condition"]); d["models"] |= {j["model"], j["ft_name"]}
+            for fam, d in by_fam.items():
+                geo_id_stage(fam, sorted(d["conds"]), sorted(d["models"]), gcfg, P, f"{name}_retention_{fam}")
+
+
+def sequential_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str]) -> None:
+    """``forgetting.sequential: [{name, steps: ["ftw:<tag>", "mados:mados-train"], models, mode, ...}]``."""
+    from reptaxonomy.gfm.forgetting import run_sequential
+    fc = dict(cfg.get("finetune", {}) or {})
+    hp = {k: fc[k] for k in ("head", "epochs", "batch_size", "lr", "backbone_lr_mult", "weight_decay",
+                             "unfreeze_fraction", "max_train_samples", "max_eval_samples", "early_stop_patience",
+                             "amp") if k in fc}
+    for chain in (cfg.get("forgetting", {}) or {}).get("sequential", []) or []:
+        chain = dict(chain)
+        steps, fams = [], []
+        try:
+            for st in chain["steps"]:
+                fam, tag = st.split(":", 1)
+                ctx = ctxs[fam]
+                r = next(x for x in ctx.runs if x.tag == tag)
+                ids = r.id_conditions or r.eval_conditions
+                steps.append({"label": f"{fam}-{tag}", "family": fam, "tag": tag, "train": _spec(r.train),
+                              "val": _spec(r.val) if r.val else None,
+                              "id_conditions": {c: _spec(ctx.by_name[c]) for c in ids if c in ctx.by_name},
+                              "num_classes": ctx.num_classes, "encoder_kwargs": {}})
+                fams.append(ctx)
+        except (KeyError, StopIteration, ValueError) as exc:
+            logger.error("[SEQ] chain %s: bad step spec (%s)", chain.get("name"), exc)
+            continue
+        models = chain.get("models") or sorted(set.intersection(*[set(ft_models(c, cfg)) for c in fams]))
+        models = [m for m in models if all(m in c.models for c in fams)]
+        for st, ctx in zip(steps, fams):
+            st["encoder_kwargs"] = {m: ctx.encoder_kwargs(m, cfg) for m in models}
+        h = dict(hp, **(chain.get("hp", {}) or {}))
+        logger.info("[SEQ] %s: %s x %s", chain.get("name"), models, [s["label"] for s in steps])
+        try:
+            run_sequential(str(chain.get("name", "chain")), models, steps, P["out_dir"], P["finetune_root"],
+                           mode=chain.get("mode", "full"), hp=h, regularizer=chain.get("regularizer"),
+                           reg_weight=float(chain.get("reg_weight", 0.0)),
+                           fisher_batches=int(chain.get("fisher_batches", 50)),
+                           num_workers=int(cfg.get("num_workers", 0)), device=cfg.get("device"),
+                           seed=int(cfg.get("seed", 0)), overwrite=bool(chain.get("overwrite", False)))
+        except Exception:
+            logger.error("[SEQ] %s failed\n%s", chain.get("name"), traceback.format_exc())
+
+
 # ----------------------------------------------------------------------------- driver
 def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: Optional[Sequence[str]] = None) -> None:
     logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     mode = cfg.get("mode", "pretrained")
-    stages = list(stages or cfg.get("stages") or (PRETRAINED_STAGES + (FINETUNE_STAGES if mode == "finetune_compare" else [])))
+    if not (stages or cfg.get("stages")):
+        stages = PRETRAINED_STAGES + (FINETUNE_STAGES + POST_STAGES if mode == "finetune_compare" else [])
+    stages = list(stages or cfg.get("stages"))
+    unknown = set(stages) - set(PRETRAINED_STAGES + FINETUNE_STAGES + POST_STAGES)
+    if unknown:
+        raise ValueError(f"unknown stages {sorted(unknown)}")
     P = _paths(cfg)
     torch.manual_seed(int(cfg.get("seed", 42)))
     models = resolve_models(cfg)
@@ -572,6 +845,8 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
             continue
         if "finetune" in stages:
             run_finetunes(ctx, cfg, P)
+        if "ft_wise" in stages and wise_names(cfg):
+            run_wise(ctx, cfg, P)
         all_ft, all_pairs = [], []
         for r in ctx.runs:
             if (cfg.get("finetune", {}) or {}).get("runs") and r.tag not in cfg["finetune"]["runs"]:
@@ -602,6 +877,13 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
                                  encoder_kwargs={m: ctx.encoder_kwargs(m, cfg) for m in ft_models(ctx, cfg)},
                                  compute_weight_change=bool((cfg.get("finetune", {}) or {}).get("weight_change", True)),
                                  seed=int(cfg.get("seed", 0)))
+
+    # ---- post-family stages (need every family's conditions / fine-tuning outputs)
+    if mode == "finetune_compare":
+        if "forgetting" in stages:
+            forgetting_stage(ctxs, cfg, P, base_ov)
+        if "ft_sequential" in stages:
+            sequential_stage(ctxs, cfg, P)
     logger.info("done. outputs under %s", P["out_dir"])
 
 
@@ -632,7 +914,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("-y", "--yaml", required=True)
     ap.add_argument("--mode", choices=["pretrained", "finetune_compare"])
-    ap.add_argument("--stages", nargs="*", help=f"subset of {PRETRAINED_STAGES + FINETUNE_STAGES}")
+    ap.add_argument("--stages", nargs="*", help=f"subset of {PRETRAINED_STAGES + FINETUNE_STAGES + POST_STAGES}")
     ap.add_argument("--datasets", nargs="*", help="subset of the config's datasets (ftw epa mados)")
     ap.add_argument("--models", nargs="*", help="override the model list (catalog keys)")
     ap.add_argument("--root-dir")
