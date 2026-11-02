@@ -4,7 +4,7 @@ import argparse
 import logging
 import math
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple
 
 import joblib
 import numpy as np
@@ -146,18 +146,57 @@ def get_indices(
 UPSAMPLE_METHODS = ("pixelshuffle", "nearest", "bilinear")
 
 
+def as_token_grid(embed: Any) -> np.ndarray:
+    """Token grid as (C, h, w): singleton leading dims are dropped, (h*w) -> (1, h, w) for 2-D input."""
+    a = np.asarray(embed)
+    shape = a.shape
+    while a.ndim > 3 and a.shape[0] == 1:
+        a = a[0]
+    if a.ndim == 2:
+        a = a[None]
+    if a.ndim != 3:
+        raise ValueError(
+            f"Expected a (C, h, w) token grid, got shape {shape}. Multi-timepoint or batched embeddings "
+            "must be pooled or indexed to one grid per chip before upsampling.")
+    return a
+
+
+def pixelshuffle_factor(channels: int, grid_hw: Tuple[int, int], image_hw: Tuple[int, int],
+                        requested: Any = None) -> Tuple[int, int]:
+    """(factor, nominal) for PixelShuffle on a (channels, h, w) grid feeding an (H, W) image.
+
+    nominal = min(H // h, W // w) // 2 (the original r = H // w // 2, now per axis), or the
+    requested integer. PixelShuffle needs channels % r**2 == 0, so the factor is the largest
+    r <= nominal that divides; 1 means no shuffle (pure bicubic upsampling).
+    """
+    h, w = max(int(grid_hw[0]), 1), max(int(grid_hw[1]), 1)
+    H, W = int(image_hw[0]), int(image_hw[1])
+    if requested is None or str(requested).lower() == "auto":
+        nominal = min(H // h, W // w) // 2
+    else:
+        nominal = int(requested)
+    nominal = max(1, nominal)
+    r = nominal
+    while r > 1 and channels % (r * r):
+        r -= 1
+    return r, nominal
+
+
 def rescale_embed(
     embed: np.ndarray,
     image_shape: int,
     target: Any,
     crop_info: Any = None,
     method: str = "pixelshuffle",
+    factor: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Map a token grid (C, h, w) to per-pixel embeddings (H*W, C').
 
     method:
-      pixelshuffle : original behaviour. PixelShuffle by r = H // w // 2 (C' = C / r^2),
-                     then bicubic interpolation to (H, W).
+      pixelshuffle : original behaviour. PixelShuffle by r = min(H // h, W // w) // 2
+                     (C' = C / r^2), then bicubic interpolation to (H, W). r is reduced to the
+                     largest value with C % r^2 == 0; pass ``factor`` to fix r across chips
+                     (run_knn_gen does, so C' is constant within a model).
       nearest      : nearest-token assignment. Every pixel receives the embedding of
                      the token whose footprint contains it (C' = C).
       bilinear     : bilinear interpolation of the token grid to (H, W)
@@ -183,17 +222,17 @@ def rescale_embed(
                 )
         return _finalize_rescaled(tensor, target, crop_info)
 
-    if image_shape[0] // embed.shape[-1]   > 2:
-        rescale_factor = int(image_shape[0] // embed.shape[-1] // 2)
-
-        #rescale_factor = image_shape[0] // embed.shape[-1] * 8
-   
-
-        #tensor = torch.flatten(tensor, start_dim=0, end_dim=1)
-
-        if tensor.ndim < 3:
-            tensor = tensor.unsqueeze(0)
-        tensor = torch.nn.PixelShuffle(rescale_factor)(tensor)
+    grid = as_token_grid(embed)
+    C, h, w = grid.shape
+    if factor is None:
+        factor, _ = pixelshuffle_factor(C, (h, w), image_shape)
+    elif C % (int(factor) ** 2):
+        reduced, _ = pixelshuffle_factor(C, (h, w), image_shape, requested=factor)
+        logger.warning("PixelShuffle factor %s does not divide C=%d; using %d", factor, C, reduced)
+        factor = reduced
+    tensor = torch.from_numpy(np.ascontiguousarray(grid)).float().unsqueeze(0)   # (1, C, h, w)
+    if int(factor) > 1:
+        tensor = torch.nn.PixelShuffle(int(factor))(tensor)
 
 
     if tensor.ndim < 4:
@@ -521,6 +560,13 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
     test_loader = build_test_loader(cfg)
     all_sil_rows: List[Dict[str, Any]] = []
 
+    # PixelShuffle factor: fixed per model on its first chip (or pixelshuffle_factor: <int>),
+    # so every chip gives the same C / r^2 even with variable crop sizes.
+    ps_requested = cfg.get("pixelshuffle_factor", "auto")
+    ps_factor: Optional[int] = None
+    ps_channels: Optional[int] = None
+    ps_mismatch = 0
+
     for run_idx in range(n_runs):
         embed_batches: List[np.ndarray] = []
         target_batches: List[np.ndarray] = []
@@ -576,7 +622,20 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else img_size
 
             if upsample_method == "pixelshuffle":
-                embed_rescaled, target_np = rescale_embed(embed, img_size, target, crop_info, method=upsample_method)
+                grid = as_token_grid(embed)
+                if ps_factor is None:
+                    ps_channels = int(grid.shape[0])
+                    ps_factor, nominal = pixelshuffle_factor(ps_channels, grid.shape[-2:], img_size, ps_requested)
+                    log = logger.warning if ps_factor != nominal else logger.info
+                    log("[%s] PixelShuffle: grid %s -> image %s, C=%d, factor %d (nominal %d) -> %d channels",
+                        model_name, tuple(grid.shape[-2:]), tuple(img_size), ps_channels, ps_factor, nominal,
+                        ps_channels // ps_factor ** 2)
+                elif grid.shape[0] != ps_channels:
+                    raise ValueError(f"{model_name}: {image_fname} has C={grid.shape[0]}, expected {ps_channels}")
+                elif pixelshuffle_factor(ps_channels, grid.shape[-2:], img_size, ps_requested)[0] != ps_factor:
+                    ps_mismatch += 1
+                embed_rescaled, target_np = rescale_embed(grid, img_size, target, crop_info,
+                                                          method=upsample_method, factor=ps_factor)
                 indices = get_indices(cfg, run_idx, image_fname, target_np, shape_info)
                 if indices.size == 0:
                     continue
@@ -592,6 +651,10 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             embed_batches.append(embed_sel.astype(np.float32, copy=False))
             target_batches.append(target_np[indices].astype(np.int32, copy=False))
 
+        if ps_mismatch:
+            logger.info("[%s] run_%s: %d chips would have used another PixelShuffle factor; kept %s",
+                        model_name, run_idx, ps_mismatch, ps_factor)
+            ps_mismatch = 0
         if not embed_batches:
             logger.warning("No embeddings selected for run_%s", run_idx)
             continue

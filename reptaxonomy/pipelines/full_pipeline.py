@@ -225,7 +225,10 @@ def run_step_block(
         key = f"{state.method or 'final'}.{step_name}.{model or 'global'}"
         up = state.upstream.get(model) if model else sorted(state.upstream.items())
         # per-model steps depend on their own model only; global steps on the whole model set
-        fp = RS.fingerprint(step_name, model, state.method, step_cfg, None if model else cfg.get("model_names"), up)
+        parts = [step_name, model, state.method, step_cfg, None if model else cfg.get("model_names"), up]
+        if str(cfg.get("pixelshuffle_factor", "auto")).lower() != "auto" and state.method == "pixelshuffle":
+            parts.append(("pixelshuffle_factor", cfg.get("pixelshuffle_factor")))
+        fp = RS.fingerprint(*parts)
         pol = state.policy
         if not state.force and not pol.should_run(state.state_dir, key, fp, state.stage, step_name):
             print(f"[PIPELINE] Skipping step={step_name} model={model or 'global'} variant={state.method}: complete")

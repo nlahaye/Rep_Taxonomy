@@ -90,6 +90,7 @@ pipeline:
   n_runs: 3
   projections: [native, umap, tsne, pca]
   upsample_methods: [pixelshuffle, nearest, bilinear]
+  pixelshuffle_factor: auto      # or an int; reduced to the largest r with C % r^2 == 0, fixed per model
   knn_metric: euclidean
   knn_k: null
   native_normalization: l2
