@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from reptaxonomy.util.general_utils import read_yaml
+from reptaxonomy.util.run_state import npy_ok, save_npy
 from reptaxonomy.util.experiment_init_utils import (
     build_dataset_bundle,
     build_dataset_spec,
@@ -291,14 +292,16 @@ def save_embedding_artifacts(
     emb_path = out_dir / f"embd_{stem}.npy"
     crop_path = out_dir / f"crop_info_{stem}.npy"
 
-    if overwrite or not emb_path.exists():
-        np.save(emb_path, feat_np)
-
+    # Atomic writes, crop info first: embd_<stem>.npy is the per-chip completion marker, so a
+    # killed run never leaves a truncated embedding (or one without its crop info) that looks done.
     crop_written = None
     if save_crop_info and crop_info is not None:
         if overwrite or not crop_path.exists():
-            np.save(crop_path, crop_info, allow_pickle=True)
+            save_npy(crop_path, crop_info, allow_pickle=True)
         crop_written = crop_path
+
+    if overwrite or not npy_ok(emb_path):
+        save_npy(emb_path, feat_np)
 
     return emb_path, crop_written
 
@@ -392,7 +395,7 @@ def run_embedding_export(cfg: Dict[str, Any]) -> None:
             image_fname = get_image_fname(loader.dataset, batch_idx)
             emb_out = out_dir / f"embd_{Path(image_fname).stem}.npy"
 
-            if emb_out.exists() and not bool(model_cfg["overwrite"]):
+            if not bool(model_cfg["overwrite"]) and npy_ok(emb_out):
                 row = {
                     "dataset": dataset_name,
                     "model": model_name,

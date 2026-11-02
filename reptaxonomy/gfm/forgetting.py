@@ -65,6 +65,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from reptaxonomy.util import run_state as RS
 from reptaxonomy.gfm.cross_condition import CondEmbeddings, paired_metrics
 from reptaxonomy.intercompare.reference_similarity import linear_cka
 
@@ -341,8 +342,14 @@ def _mean_miou(metrics: Optional[Dict[str, Any]], conds: Sequence[str]) -> float
 
 def run_forgetting(family: str, jobs: Sequence[Dict[str, Any]], embed_dir: str, work_dir: str, out_dir: str,
                    finetune_root: str, params: Optional[Mapping[str, Any]] = None, seed: int = 0,
-                   device: Optional[str] = None, predictors: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
+                   device: Optional[str] = None, predictors: Optional[pd.DataFrame] = None,
+                   policy: Optional["RS.RunPolicy"] = None) -> Dict[str, pd.DataFrame]:
     """Representation forgetting for one fine-tuning family.
+
+    Each (job, retention set) is a resumable unit cached in ``_units/`` (retention row
+    + layer-wise CKA rows) and keyed on its embeddings / checkpoint / parameters, so a
+    killed run only recomputes unfinished units; the summary tables are rebuilt from
+    the units every time.
 
     Each job: ``{"run", "model", "variant", "ft_name", "id_conditions", "ood_conditions",
     "retention": [{"condition", "family", "relation", "spec", "pre_kwargs"}], "ft_ckpt"}``.
@@ -355,6 +362,9 @@ def run_forgetting(family: str, jobs: Sequence[Dict[str, Any]], embed_dir: str, 
     out.mkdir(parents=True, exist_ok=True)
     rows, lrows = [], []
     cache: Dict[Tuple[str, str], CondEmbeddings] = {}
+    pol = policy or RS.RunPolicy()
+    units = out / "_units"
+    metric_params = {k: v for k, v in p.items() if k not in ("figure_formats", "layerwise")}
 
     def emb(cond: str, model: str) -> CondEmbeddings:
         key = (cond, model)
@@ -369,37 +379,60 @@ def run_forgetting(family: str, jobs: Sequence[Dict[str, Any]], embed_dir: str, 
             base = {"run": job["run"], "model": job["model"], "variant": job["variant"],
                     "finetuned_model": job["ft_name"], "retention_condition": cond,
                     "retention_family": ret["family"], "relation": ret["relation"]}
+            do_lw = bool(lw.get("enabled", True) and ret.get("spec") and job.get("ft_ckpt") and ret.get("layerwise", True))
+            key = f"{job['ft_name']}__{cond}"
+            fp = RS.fingerprint("forgetting", base, metric_params, lw if do_lw else None, seed,
+                                RS.stamp(Path(embed_dir, cond, job["model"], "test"), "embed"),
+                                RS.stamp(Path(embed_dir, cond, job["ft_name"], "test"), "embed"),
+                                RS.file_stamp(job["ft_ckpt"]) if job.get("ft_ckpt") else None)
+            if not pol.should_run(units, key, fp, "forgetting"):
+                try:
+                    u = json.loads((units / f"{RS._safe(key)}.json").read_text())
+                    rows += u["rows"]; lrows += u["layerwise"]
+                    continue
+                except Exception:
+                    pass
+            pol.begin(units, key, fp)
+            u_rows, u_lw, ok = [], [], True
             try:
                 A, B = emb(cond, job["model"]), emb(cond, job["ft_name"])
                 if len(A) < 3 or len(B) < 3:
                     logger.warning("[forgetting] %s / %s: missing embeddings on %s", job["model"], job["ft_name"], cond)
                     continue
-                rows.append({**base, **retention_metrics(A, B, p, seed=seed)})
+                u_rows.append({**base, **retention_metrics(A, B, p, seed=seed)})
             except Exception as exc:
+                ok = False
+                pol.failed(units, key, f"retention metrics: {exc}")
                 logger.warning("[forgetting] %s on %s failed: %s", job["ft_name"], cond, exc)
-            if lw.get("enabled", True) and ret.get("spec") and job.get("ft_ckpt") and ret.get("layerwise", True):
+            if do_lw:
                 try:
                     df = layerwise_cka(job["model"], ret["pre_kwargs"], job["ft_ckpt"], ret["spec"], lw, device)
                     for r in df.to_dict("records"):
-                        lrows.append({**base, **r})
+                        u_lw.append({**base, **r})
                 except Exception as exc:
+                    ok = False
+                    pol.failed(units, key, f"layer-wise CKA: {exc}")
                     logger.warning("[forgetting] layer-wise CKA %s on %s failed: %s", job["ft_name"], cond, exc)
+            rows += u_rows; lrows += u_lw
+            if ok:
+                RS.write_json(units / f"{RS._safe(key)}.json", {"rows": u_rows, "layerwise": u_lw})
+                pol.done(units, key, fp)
         # cache is per family; drop fine-tuned entries to bound memory
         for k in [k for k in cache if k[1] == job["ft_name"]]:
             cache.pop(k, None)
 
     ret_df = pd.DataFrame(rows)
-    ret_df.to_csv(out / "retention_metrics.csv", index=False)
+    RS.to_csv(ret_df, out / "retention_metrics.csv", index=False)
     lw_df = pd.DataFrame(lrows)
-    lw_df.to_csv(out / "layerwise_cka.csv", index=False)
+    RS.to_csv(lw_df, out / "layerwise_cka.csv", index=False)
     trade = tradeoff_table(jobs, ret_df, finetune_root, family, out_dir)
     if predictors is not None and not predictors.empty and not trade.empty:
         trade = trade.merge(predictors, on="model", how="left")
-    trade.to_csv(out / "tradeoff.csv", index=False)
+    RS.to_csv(trade, out / "tradeoff.csv", index=False)
     corr = forgetting_correlations(trade)
-    corr.to_csv(out / "correlations.csv", index=False)
+    RS.to_csv(corr, out / "correlations.csv", index=False)
     if not lw_df.empty:
-        depth_summary(lw_df).to_csv(out / "layerwise_summary.csv", index=False)
+        RS.to_csv(depth_summary(lw_df), out / "layerwise_summary.csv", index=False)
     try:
         plot_forgetting(trade, lw_df, out, p.get("figure_formats", ["png"]))
     except Exception as exc:
@@ -540,13 +573,18 @@ def run_sequential(name: str, models: Sequence[str], steps: Sequence[Dict[str, A
                    finetune_root: str, mode: str = "full", hp: Optional[Dict[str, Any]] = None,
                    regularizer: Optional[str] = None, reg_weight: float = 0.0, fisher_batches: int = 50,
                    num_workers: int = 0, device: Optional[str] = None, seed: int = 0,
-                   overwrite: bool = False) -> pd.DataFrame:
+                   overwrite: bool = False, check_config: bool = True) -> pd.DataFrame:
     """Fine-tune each model through ``steps`` in order; report accuracy matrix / BWT.
 
     Each step: ``{"label", "family", "tag", "train": {cls, kwargs}, "val": {...}|None,
     "id_conditions": {cond: {cls, kwargs}}, "num_classes", "encoder_kwargs": {model: kw}}``.
     Step ``j`` starts from the backbone of step ``j-1``; each step keeps its own head,
     which is frozen when that task is re-evaluated after later steps.
+
+    Restarts: completed steps are reused (``run_finetune`` skips them; a retrained
+    step invalidates the later ones through the checkpoint stamp in their
+    fingerprints), and each accumulated Fisher and (step, task) evaluation is cached
+    next to its step, keyed on the checkpoints it was computed from.
     """
     from reptaxonomy.gfm.encoders import GFMEncoder
     from reptaxonomy.gfm.finetune import _loader, estimate_fisher, evaluate_checkpoint, load_head, run_finetune
@@ -570,13 +608,21 @@ def run_sequential(name: str, models: Sequence[str], steps: Sequence[Dict[str, A
             fisher_path = None
             if regularizer == "ewc" and fisher_acc is not None:
                 fisher_path = str(sdir / "fisher_prev.pt"); sdir.mkdir(parents=True, exist_ok=True)
-                torch.save(fisher_acc, fisher_path)
+                # rewrite only when changed: its stamp is part of this step's fine-tune fingerprint
+                if not (Path(fisher_path).exists() and _same_tensors(torch.load(fisher_path, weights_only=False), fisher_acc)):
+                    RS.torch_save(fisher_acc, fisher_path)
             run_finetune(m, enc_kw, st["train"], st.get("val"), st["id_conditions"], int(st["num_classes"]), sdir,
                          mode=mode, num_workers=num_workers, device=device, seed=seed, overwrite=overwrite,
                          regularizer=regularizer if j > 0 else None, reg_weight=reg_weight, fisher_path=fisher_path,
-                         variant=f"seq-{mode}", **hp)
+                         variant=f"seq-{mode}", check_config=check_config, **hp)
             ck = str(sdir / "model.pt"); ckpts.append(ck); prev_ckpt = ck
-            if regularizer == "ewc":
+            acc_path = sdir / "fisher_acc.pt"
+            acc_fp = RS.fingerprint("fisher", RS.file_stamp(ck), RS.file_stamp(fisher_path) if fisher_path else None,
+                                    fisher_batches)
+            if regularizer == "ewc" and not overwrite and RS.read_marker(sdir, "fisher") and \
+                    RS.read_marker(sdir, "fisher").get("fingerprint") == acc_fp and acc_path.exists():
+                fisher_acc = torch.load(acc_path, map_location="cpu", weights_only=False)
+            elif regularizer == "ewc":
                 try:
                     enc = GFMEncoder(m, **dict(st["encoder_kwargs"][m], checkpoint=ck)).to(dev)
                     head = load_head(ck, dev)
@@ -584,25 +630,41 @@ def run_sequential(name: str, models: Sequence[str], steps: Sequence[Dict[str, A
                                  num_workers, hp.get("max_train_samples"))
                     f_new = estimate_fisher(enc, head, tl, dev, fisher_batches)
                     fisher_acc = f_new if fisher_acc is None else {k: fisher_acc.get(k, 0) + v for k, v in f_new.items()}
+                    RS.torch_save(fisher_acc, acc_path); RS.mark_done(sdir, "fisher", acc_fp)
                     del enc
                 except Exception as exc:
                     logger.warning("[sequential] Fisher estimation failed (%s step %d): %s", m, j, exc)
             # re-evaluate every task seen so far with its own (frozen) head
             for i in range(j + 1):
                 si = steps[i]
+                ev_path = sdir / f"eval_task{i}.json"
+                ev_fp = RS.fingerprint("seq_eval", RS.file_stamp(ck), RS.file_stamp(ckpts[i]), sorted(si["id_conditions"]),
+                                       hp.get("max_eval_samples"))
                 try:
-                    res = evaluate_checkpoint(m, si["encoder_kwargs"][m], ck, si["id_conditions"], int(si["num_classes"]),
-                                              batch_size=int(hp.get("batch_size", 8)), num_workers=num_workers,
-                                              max_eval_samples=hp.get("max_eval_samples"), device=device,
-                                              head_ckpt=ckpts[i])
-                    v = [c["mIoU"] for c in res["conditions"].values() if np.isfinite(c["mIoU"])]
-                    R[j, i] = float(np.mean(v)) if v else np.nan
+                    cached = json.loads(ev_path.read_text()) if ev_path.exists() and not overwrite else None
+                    if cached is not None and cached.get("fingerprint") == ev_fp:
+                        R[j, i] = float(cached["mIoU"]) if cached["mIoU"] is not None else np.nan
+                    else:
+                        res = evaluate_checkpoint(m, si["encoder_kwargs"][m], ck, si["id_conditions"],
+                                                  int(si["num_classes"]), batch_size=int(hp.get("batch_size", 8)),
+                                                  num_workers=num_workers, max_eval_samples=hp.get("max_eval_samples"),
+                                                  device=device, head_ckpt=ckpts[i])
+                        v = [c["mIoU"] for c in res["conditions"].values() if np.isfinite(c["mIoU"])]
+                        R[j, i] = float(np.mean(v)) if v else np.nan
+                        RS.write_json(ev_path, {"fingerprint": ev_fp, "mIoU": None if np.isnan(R[j, i]) else R[j, i]})
                 except Exception as exc:
                     logger.warning("[sequential] eval %s step %d task %d failed: %s", m, j, i, exc)
                 mat_rows.append({"model": m, "after_step": j, "after_label": st["label"], "task": i,
                                  "task_label": si["label"], "mIoU": R[j, i]})
         sum_rows.append({"model": m, "sequence": "->".join(s["label"] for s in steps), "mode": mode,
                          "regularizer": regularizer or "none", **continual_metrics(R)})
-    mat = pd.DataFrame(mat_rows); mat.to_csv(out / "accuracy_matrix.csv", index=False)
-    summ = pd.DataFrame(sum_rows); summ.to_csv(out / "sequential_summary.csv", index=False)
+    mat = pd.DataFrame(mat_rows); RS.to_csv(mat, out / "accuracy_matrix.csv", index=False)
+    summ = pd.DataFrame(sum_rows); RS.to_csv(summ, out / "sequential_summary.csv", index=False)
     return summ
+
+
+def _same_tensors(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    try:
+        return a.keys() == b.keys() and all(torch.equal(torch.as_tensor(a[k]), torch.as_tensor(b[k])) for k in a)
+    except Exception:
+        return False

@@ -71,6 +71,18 @@ Layout (all under ``root_dir``)::
     outputs/cross_condition/<ds>/...  outputs/finetune_compare/<ds>/...
     outputs/geo_id/<ds>/...  outputs/geo_id/<ds>_<tag>_ft/...
     finetune/<ds>/<tag>/<model>/<mode>/{model.pt,metrics.json}
+
+Restart / retry (``reptaxonomy.util.run_state``)::
+
+    Every expensive unit writes a completion marker ``_DONE.<key>.json`` last, and
+    outputs are written atomically, so a killed run can simply be re-run with the same
+    command. Finished units are skipped; failed (``_FAILED.*``) and interrupted
+    (``_RUNNING.*``) units are redone. Fine-tunes resume from their last epoch
+    (``finetune.resume_training``). Units whose configuration or upstream outputs
+    changed are recomputed (``resume.check_config``). ``overwrite: true | [stage,
+    "pipeline:<step>", ...]`` (or ``--overwrite [STAGE ...]``) forces recomputation;
+    restart an interrupted overwrite run without ``--overwrite``. Status:
+    ``python -m reptaxonomy.util.run_state <root_dir> [--failed]``.
 """
 
 from __future__ import annotations
@@ -97,6 +109,7 @@ from reptaxonomy.gfm.conditions import Condition, build_conditions
 from reptaxonomy.gfm.cross_condition import run_cross_condition
 from reptaxonomy.gfm.datasets import IGNORE_INDEX, LABEL_KEY, REPSET_CLASSES, load_or_compute_band_stats
 from reptaxonomy.robustness.geo_intrinsic_dimension import run_geo_id
+from reptaxonomy.util import run_state as RS
 
 logger = logging.getLogger("reptaxonomy.gfm_experiment")
 
@@ -105,6 +118,9 @@ FINETUNE_STAGES = ["finetune", "ft_wise", "ft_embed", "ft_pipeline", "finetune_c
 # run after the per-family loop (they need every family's conditions / outputs)
 POST_STAGES = ["forgetting", "ft_sequential"]
 BASE_MODES = ("linear", "partial", "full", "lpft", "lora")
+FT_HP_KEYS = ("head", "epochs", "batch_size", "lr", "backbone_lr_mult", "weight_decay", "unfreeze_fraction",
+              "max_train_samples", "max_eval_samples", "early_stop_patience", "amp", "resume_training",
+              "checkpoint_every")
 REPSET_INFO = {"FTWRepSet": ("s2", 10.0), "EPARepSet": ("s2", 10.0), "MADOSRepSet": ("s2", 10.0)}
 
 
@@ -217,17 +233,41 @@ def _nearest(lab: np.ndarray, size: int) -> np.ndarray:
     return lab[np.ix_(ys, xs)]
 
 
-def write_condition_cache(ds, cond: Condition, work_dir: str, label_grid: int, overwrite: bool) -> Dict[str, Any]:
+def _cache_fp(cond: Condition, label_grid: int) -> str:
+    return RS.fingerprint("cache", cond.cls, cond.kwargs, label_grid)
+
+
+def cache_done(cond: Condition, work_dir: str, label_grid: int, overwrite: bool = False,
+               check_config: bool = True) -> Optional[Dict[str, Any]]:
+    """Manifest of a complete, current condition cache (None -> (re)build it)."""
+    man_p = Path(work_dir, "manifests", f"{cond.name}.json")
+    lab_p = Path(work_dir, "labels", f"{cond.name}.npz")
+    if overwrite or not (man_p.exists() and lab_p.exists()):
+        return None
+    try:
+        man = json.loads(man_p.read_text())
+    except Exception:
+        return None
+    if check_config and man.get("fingerprint") not in (None, _cache_fp(cond, label_grid)):
+        logger.info("[cache] %s: configuration changed, rebuilding", cond.name)
+        return None
+    return man
+
+
+def write_condition_cache(ds, cond: Condition, work_dir: str, label_grid: int, overwrite: bool,
+                          check_config: bool = True) -> Dict[str, Any]:
     man_p = Path(work_dir, "manifests", f"{cond.name}.json")
     lab_p = Path(work_dir, "labels", f"{cond.name}.npz")
     man_p.parent.mkdir(parents=True, exist_ok=True)
     lab_p.parent.mkdir(parents=True, exist_ok=True)
-    if man_p.exists() and lab_p.exists() and not overwrite:
-        return json.loads(man_p.read_text())
+    man = cache_done(cond, work_dir, label_grid, overwrite, check_config)
+    if man is not None:
+        return man
     stems = [Path(f).stem for f in ds.img_files]
     man = {"condition": cond.name, "setup": cond.setup, "role": cond.role, "paired_with": cond.paired_with,
            "tags": cond.tags, "kwargs": cond.kwargs, "stems": stems, "sample_keys": list(ds.sample_keys),
-           "pair_keys": list(ds.pair_keys), "describe": ds.describe()}
+           "pair_keys": list(ds.pair_keys), "describe": ds.describe(),
+           "fingerprint": _cache_fp(cond, label_grid)}
     labels: Dict[str, np.ndarray] = {}
     hist = np.zeros(max(int(ds.num_classes), 1) + 1, dtype=np.int64)
     lats, lons, times = [float("nan")] * len(stems), [float("nan")] * len(stems), [None] * len(stems)
@@ -249,13 +289,15 @@ def write_condition_cache(ds, cond: Condition, work_dir: str, label_grid: int, o
     rows = getattr(ds, "meta_rows", None)
     if rows and len(rows) == len(stems):
         man["point_tags"] = {k: [r.get(k) for r in rows] for k in rows[0] if k != "aoi_id"}
-    np.savez_compressed(lab_p, **labels)
-    man_p.write_text(json.dumps(man, indent=1, default=str))
+    # labels first, manifest last: the manifest is the completion marker of the cache
+    RS.savez_compressed(lab_p, **labels)
+    RS.write_json(man_p, man)
     return man
 
 
 def prepare(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str], models: List[str]) -> None:
-    overwrite = bool(cfg.get("overwrite_cache", False))
+    pol = RS.policy_from(cfg)
+    overwrite = pol.overwrite("prepare")
     label_grid = int(cfg.get("label_grid", 64))
     min_cov = float(cfg.get("min_band_coverage", 0.25))
     cov_rows = []
@@ -282,8 +324,10 @@ def prepare(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, s
         for cname in sorted(needed):
             cond = ctx.by_name[cname]
             try:
-                ds = ref_ds if cname == ref_name else _instantiate(cond)
-                man = write_condition_cache(ds, cond, P["work_dir"], label_grid, overwrite)
+                man = cache_done(cond, P["work_dir"], label_grid, overwrite, pol.check_config)
+                if man is None:   # only instantiate datasets whose cache is missing / stale
+                    ds = ref_ds if cname == ref_name else _instantiate(cond)
+                    man = write_condition_cache(ds, cond, P["work_dir"], label_grid, overwrite, pol.check_config)
                 logger.info("[%s] %s: %d chips", name, cname, len(man["stems"]))
             except Exception as exc:
                 logger.error("[%s] condition %s failed to build: %s", name, cname, exc)
@@ -301,10 +345,9 @@ def prepare(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, s
                 ctx.models.append(m)
             cov_rows.append({"dataset": name, "model": m, "band_coverage": round(cov, 3), "used": ok,
                              "reason": "" if ok else f"coverage<{min_cov}"})
-        Path(P["work_dir"], "band_stats").mkdir(parents=True, exist_ok=True)
-        Path(P["work_dir"], "band_stats", f"{name}.json").write_text(json.dumps(ctx.band_stats, indent=1))
+        RS.write_json(Path(P["work_dir"], "band_stats", f"{name}.json"), ctx.band_stats)
 
-    with open(Path(P["work_dir"], "model_coverage.csv"), "w", newline="") as fh:
+    with RS.atomic_path(Path(P["work_dir"], "model_coverage.csv")) as tmp, open(tmp, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["dataset", "model", "band_coverage", "used", "reason"])
         w.writeheader(); w.writerows(cov_rows)
     write_plan(ctxs, cfg, P)
@@ -326,15 +369,16 @@ def write_plan(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str
                                "eval_conditions": r.eval_conditions, "id_conditions": r.id_conditions,
                                "ood_conditions": r.ood_conditions} for r in ctx.runs],
         }
-    Path(P["work_dir"], "plan.json").write_text(json.dumps(plan, indent=1, default=str))
+    RS.write_json(Path(P["work_dir"], "plan.json"), plan)
     return plan
 
 
 def load_plan_into(ctxs: Dict[str, DatasetContext], P: Dict[str, str]) -> bool:
     p = Path(P["work_dir"], "plan.json")
-    if not p.exists():
+    try:
+        plan = json.loads(p.read_text())
+    except Exception:   # missing or unreadable -> re-run prepare
         return False
-    plan = json.loads(p.read_text())
     for name, ctx in ctxs.items():
         d = plan["datasets"].get(name)
         if not d:
@@ -349,36 +393,105 @@ def load_plan_into(ctxs: Dict[str, DatasetContext], P: Dict[str, str]) -> bool:
 
 
 # ----------------------------------------------------------------------------- embeddings
-def _embed_done(P: Dict[str, str], cond: str, model: str) -> bool:
-    man = Path(P["work_dir"], "manifests", f"{cond}.json")
-    if not man.exists():
-        return False
-    stems = json.loads(man.read_text())["stems"]
-    d = Path(P["embed_dir"], cond, model, "test")
-    return bool(stems) and all((d / f"embd_{s}.npy").exists() for s in stems)
+EMBED_KEY = "embed"
+
+
+def embed_unit(P: Dict[str, str], cond: str, model: str) -> Path:
+    return Path(P["embed_dir"], cond, model, "test")
+
+
+def _stems(P: Dict[str, str], cond: str) -> List[str]:
+    try:
+        return json.loads(Path(P["work_dir"], "manifests", f"{cond}.json").read_text())["stems"]
+    except Exception:
+        return []
+
+
+def _embed_files_ok(P: Dict[str, str], cond: str, model: str, validate: bool = True) -> bool:
+    stems, d = _stems(P, cond), embed_unit(P, cond, model)
+    ok = RS.npy_ok if validate else (lambda p: Path(p).exists())
+    return bool(stems) and all(ok(d / f"embd_{s}.npy") for s in stems)
+
+
+def embed_fp(ctx: DatasetContext, cond: Condition, model: str, cfg: Dict[str, Any],
+             overrides: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    kw = ctx.encoder_kwargs(model, cfg, (overrides or {}).get(model))
+    return RS.fingerprint("embed", cond.cls, cond.kwargs, model, kw, RS.file_stamp(kw["checkpoint"])
+                          if kw.get("checkpoint") else None)
+
+
+def _embed_done(P: Dict[str, str], cond: str, model: str, fp: Optional[str] = None,
+                pol: Optional[RS.RunPolicy] = None) -> bool:
+    """Embeddings of (cond, model) complete. Pre-marker outputs are validated and adopted."""
+    pol = pol or RS.RunPolicy()
+    d = embed_unit(P, cond, model)
+    if pol.is_done(d, EMBED_KEY, fp):
+        return _embed_files_ok(P, cond, model, validate=False)
+    if RS.read_marker(d, EMBED_KEY) is None and RS.read_marker(d, EMBED_KEY, RS.RUNNING_PREFIX) is None \
+            and _embed_files_ok(P, cond, model, pol.validate_files):
+        pol.done(d, EMBED_KEY, fp, adopted=True, n=len(_stems(P, cond)))
+        return True
+    return False
+
+
+def embed_stamp(P: Dict[str, str], cond: str, model: str) -> Optional[str]:
+    return RS.stamp(embed_unit(P, cond, model), EMBED_KEY)
+
+
+def _purge_embeddings(d: Path) -> None:
+    n = 0
+    for pat in ("embd_*.npy", "crop_info_*.npy", "embedding_manifest.csv", ".embd_*"):
+        for f in d.glob(pat):
+            f.unlink(missing_ok=True); n += 1
+    if n:
+        logger.info("[EMBED] %s: discarded %d stale files", d, n)
 
 
 def embed_condition(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Dict[str, Any],
-                    P: Dict[str, str], overrides: Dict[str, Dict[str, Any]]) -> None:
-    todo = [m for m in models if cfg.get("overwrite_embeddings") or not _embed_done(P, cond.name, m)]
+                    P: Dict[str, str], overrides: Dict[str, Dict[str, Any]], stage: str = "embed") -> None:
+    pol = RS.policy_from(cfg)
+    fps = {m: embed_fp(ctx, cond, m, cfg, overrides) for m in models}
+    todo = []
+    for m in models:
+        d = embed_unit(P, cond.name, m)
+        if pol.done_now(d, EMBED_KEY):
+            continue
+        if not pol.overwrite(stage) and _embed_done(P, cond.name, m, fps[m], pol):
+            continue
+        d.mkdir(parents=True, exist_ok=True)
+        if pol.is_stale(d, EMBED_KEY, fps[m], stage):
+            _purge_embeddings(d)         # overwrite / changed config: never mix old and new chips
+        pol.begin(d, EMBED_KEY, fps[m])  # per-chip files of an interrupted unit are kept and reused
+        todo.append(m)
     if not todo:
         return
     backend = str(cfg.get("embedding_backend", "reptaxonomy"))
-    if backend == "fast":
-        return _embed_fast(ctx, cond, todo, cfg, P, overrides)
-    from reptaxonomy.pipelines.generate_embeddings import run_embedding_export
-    dataset, dataset_init = ctx.dataset_cfg(cond)
-    ecfg = {
-        "dataset": dataset, "dataset_init": dataset_init, "model_names": todo,
-        "model_init": dict(cfg.get("model_init", {}) or {}),
-        "per_model_overrides": {m: dict(overrides.get(m, {})) for m in todo},
-        "embed_dir": P["embed_dir"], "work_dir": P["work_dir"], "split": "test", "batch_size": 1,
-        "num_workers": int(cfg.get("num_workers", 0)), "overwrite": bool(cfg.get("overwrite_embeddings", False)),
-        "fail_fast": bool(cfg.get("fail_fast", False)), "seed": int(cfg.get("seed", 42)),
-        "device": cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"),
-        "test_num_workers": int(cfg.get("num_workers", 0)),
-    }
-    run_embedding_export(ecfg)
+    try:
+        if backend == "fast":
+            _embed_fast(ctx, cond, todo, cfg, P, overrides)
+        else:
+            from reptaxonomy.pipelines.generate_embeddings import run_embedding_export
+            dataset, dataset_init = ctx.dataset_cfg(cond)
+            ecfg = {
+                "dataset": dataset, "dataset_init": dataset_init, "model_names": todo,
+                "model_init": dict(cfg.get("model_init", {}) or {}),
+                "per_model_overrides": {m: dict(overrides.get(m, {})) for m in todo},
+                "embed_dir": P["embed_dir"], "work_dir": P["work_dir"], "split": "test", "batch_size": 1,
+                "num_workers": int(cfg.get("num_workers", 0)), "overwrite": False,
+                "fail_fast": bool(cfg.get("fail_fast", False)), "seed": int(cfg.get("seed", 42)),
+                "device": cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"),
+                "test_num_workers": int(cfg.get("num_workers", 0)),
+            }
+            run_embedding_export(ecfg)
+    finally:
+        for m in todo:
+            d = embed_unit(P, cond.name, m)
+            if _embed_files_ok(P, cond.name, m, pol.validate_files):
+                pol.done(d, EMBED_KEY, fps[m], n=len(_stems(P, cond.name)))
+            else:
+                missing = sum(not RS.npy_ok(d / f"embd_{s}.npy") for s in _stems(P, cond.name))
+                pol.failed(d, EMBED_KEY, f"{missing} chips missing or incomplete")
+                logger.warning("[EMBED] %s %s: %d chips missing -- re-run to retry", cond.name, m, missing)
 
 
 def _embed_fast(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Dict[str, Any],
@@ -388,12 +501,19 @@ def _embed_fast(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Di
     from reptaxonomy.gfm.encoders import GFMEncoder
     from reptaxonomy.util.experiment_init_utils import build_forward_instruments_collate_fn
     dev = torch.device(cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
+    from torch.utils.data import Subset
     ds = _instantiate(cond)
-    stems = [Path(f).stem for f in ds.img_files]
-    loader = DataLoader(ds, batch_size=int(cfg.get("embed_batch_size", 8)), shuffle=False,
-                        num_workers=int(cfg.get("num_workers", 0)), collate_fn=build_forward_instruments_collate_fn({}))
+    stems_all = [Path(f).stem for f in ds.img_files]
     for m in models:
         out = Path(P["embed_dir"], cond.name, m, "test"); out.mkdir(parents=True, exist_ok=True)
+        # chips already written by an interrupted run are complete (atomic writes) and kept
+        idx = [i for i, st in enumerate(stems_all) if not RS.npy_ok(out / f"embd_{st}.npy")]
+        if not idx:
+            continue
+        stems = [stems_all[i] for i in idx]
+        loader = DataLoader(Subset(ds, idx), batch_size=int(cfg.get("embed_batch_size", 8)), shuffle=False,
+                            num_workers=int(cfg.get("num_workers", 0)),
+                            collate_fn=build_forward_instruments_collate_fn({}))
         try:
             enc = GFMEncoder(m, **ctx.encoder_kwargs(m, cfg, overrides.get(m))).to(dev).eval()
             k = 0
@@ -401,8 +521,8 @@ def _embed_fast(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Di
                 for batch in loader:
                     g = enc.forward_features(batch, device=dev).float().cpu().numpy()
                     for j in range(g.shape[0]):
-                        np.save(out / f"embd_{stems[k]}.npy", g[j]); k += 1
-            logger.info("[EMBED-fast] %s %s: %d", cond.name, m, k)
+                        RS.save_npy(out / f"embd_{stems[k]}.npy", g[j]); k += 1
+            logger.info("[EMBED-fast] %s %s: %d new (%d reused)", cond.name, m, k, len(stems_all) - len(idx))
             del enc
         except Exception:
             logger.error("[EMBED-fast] %s %s failed\n%s", cond.name, m, traceback.format_exc())
@@ -415,9 +535,10 @@ def _embed_fast(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Di
 # ----------------------------------------------------------------------------- full pipeline
 def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Dict[str, Any],
                        P: Dict[str, str], out_root: str, overrides: Dict[str, Dict[str, Any]],
-                       training_pairs: Sequence[Sequence[str]] = ()) -> None:
+                       training_pairs: Sequence[Sequence[str]] = (), stage: str = "pipeline") -> None:
     from reptaxonomy.pipelines.full_pipeline import run_full_pipeline
-    present = [m for m in models if _embed_done(P, cond.name, m)]
+    pol = RS.policy_from(cfg)
+    present = [m for m in models if _embed_done(P, cond.name, m, pol=pol)]
     missing = sorted(set(models) - set(present))
     if missing:
         logger.warning("[PIPELINE] %s: skipping models without complete embeddings: %s", cond.name, missing)
@@ -448,6 +569,10 @@ def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], 
     if inv is not None and not inv.get("invariance_pairs") and pairs:
         steps.setdefault("invariance_checks", {}).setdefault("config_overrides", {})["invariance_pairs"] = pairs[:2]
     Path(pcfg["work_dir"]).mkdir(parents=True, exist_ok=True)
+    # step-level resume inside full_pipeline: markers under <out_root>/_state/<cond>/
+    pcfg["_run_policy"], pcfg["_stage"] = pol, stage
+    pcfg["_state_dir"] = str(Path(out_root, "_state", cond.name))
+    pcfg["_upstream"] = {m: embed_stamp(P, cond.name, m) for m in present}
     try:
         run_full_pipeline(pcfg)
     except Exception:
@@ -457,11 +582,16 @@ def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], 
 
 
 def family_synthesis(ctx: DatasetContext, cond_names: List[str], models: List[str], cfg: Dict[str, Any],
-                     P: Dict[str, str], out_root: str, tag: str, training_pairs: Sequence[Sequence[str]] = ()) -> None:
+                     P: Dict[str, str], out_root: str, tag: str, training_pairs: Sequence[Sequence[str]] = (),
+                     stage: str = "synthesis") -> None:
     from reptaxonomy.summarize.cross_perspective_synthesis import run_cross_perspective_synthesis
     have = [c for c in cond_names if Path(out_root, c).exists()]
     if not have:
         return
+    pol = RS.policy_from(cfg)
+    unit = Path(out_root, "_state", f"synthesis_{tag}")
+    upstream = {c: sorted((p.name, RS.file_stamp(p)) for p in Path(out_root, "_state", c).glob(RS.DONE_PREFIX + "*"))
+                for c in have}
     pipe = cfg.get("pipeline", {}) or {}
     methods = [str(m).lower() for m in pipe.get("upsample_methods", ["pixelshuffle"])]
     base_syn = (pipe.get("steps", {}).get("cross_perspective_synthesis", {}) or {}).get("config_overrides", {}).get("synthesis", {})
@@ -472,10 +602,17 @@ def family_synthesis(ctx: DatasetContext, cond_names: List[str], models: List[st
                              for i, m in enumerate(methods)},
                 "primary_variant": methods[0]})
     syn.update(cfg.get("synthesis", {}) or {})
+    fp = RS.fingerprint("synthesis", models, syn, pipe.get("projections"), upstream)
+    if not pol.should_run(unit, "synthesis", fp, stage):
+        logger.info("[SYNTHESIS] %s complete, skipped", tag)
+        return
+    pol.begin(unit, "synthesis", fp)
     try:
         run_cross_perspective_synthesis({"out_dir": out_root, "embed_dir": P["embed_dir"], "model_names": models,
                                          "projections": pipe.get("projections"), "synthesis": syn})
+        pol.done(unit, "synthesis", fp)
     except Exception:
+        pol.failed(unit, "synthesis", traceback.format_exc())
         logger.error("[SYNTHESIS] %s failed\n%s", tag, traceback.format_exc())
 
 
@@ -521,9 +658,8 @@ def ft_models(ctx: DatasetContext, cfg: Dict[str, Any]) -> List[str]:
 def run_finetunes(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> None:
     from reptaxonomy.gfm.finetune import run_finetune
     fc = dict(cfg.get("finetune", {}) or {})
-    hp = {k: fc[k] for k in ("head", "epochs", "batch_size", "lr", "backbone_lr_mult", "weight_decay",
-                             "unfreeze_fraction", "max_train_samples", "max_eval_samples", "early_stop_patience",
-                             "amp") if k in fc}
+    pol = RS.policy_from(cfg)
+    hp = {k: fc[k] for k in FT_HP_KEYS if k in fc}
     per_family = (fc.get("per_family", {}) or {})
     for r in ctx.runs:
         if fc.get("runs") and r.tag not in fc["runs"]:
@@ -550,8 +686,13 @@ def run_finetunes(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -
                                  {"cls": r.val.cls, "kwargs": r.val.kwargs} if r.val else None, evals,
                                  ctx.num_classes, out, mode=mode, num_workers=int(cfg.get("num_workers", 0)),
                                  device=cfg.get("device"), seed=int(cfg.get("seed", 0)),
-                                 overwrite=bool(fc.get("overwrite", False)), variant=name, **h)
+                                 overwrite=pol.overwrite("finetune") and not pol.done_now(out, "finetune"),
+                                 check_config=pol.check_config, variant=name, **h)
+                    fp = RS.fingerprint(RS.file_stamp(out / "metrics.json"))
+                    if (RS.read_marker(out, "finetune") or {}).get("fingerprint") != fp:   # skipped runs keep theirs
+                        pol.done(out, "finetune", fp)
                 except Exception:
+                    pol.failed(out, "finetune", traceback.format_exc())
                     logger.error("[FT] %s %s %s failed\n%s", r.tag, m, name, traceback.format_exc())
                     if cfg.get("fail_fast"):
                         raise
@@ -563,6 +704,7 @@ def run_wise(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> Non
     """WiSE-FT checkpoints + metrics for every (run, model): linear run <-> source variant."""
     from reptaxonomy.gfm.finetune import evaluate_checkpoint, wise_interpolate
     fc = dict(cfg.get("finetune", {}) or {})
+    pol = RS.policy_from(cfg)
     w = dict(fc.get("wise_ft", {}) or {})
     src = str(w.get("source_variant", "full"))
     for r in ctx.runs:
@@ -573,7 +715,8 @@ def run_wise(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> Non
         for m in ft_models(ctx, cfg):
             base = Path(P["finetune_root"], ctx.name, r.tag, m)
             lin, ft = base / "linear" / "model.pt", base / src / "model.pt"
-            if not (lin.exists() and ft.exists()):
+            if not (lin.exists() and ft.exists() and (lin.parent / "metrics.json").exists()
+                    and (ft.parent / "metrics.json").exists()):
                 logger.warning("[WISE] %s %s: need linear and %s checkpoints", r.tag, m, src)
                 continue
             for a in w.get("alphas", [0.5]):
@@ -582,8 +725,11 @@ def run_wise(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> Non
                     continue
                 name = f"wise{int(round(a * 100)):03d}"
                 out = base / name
-                if (out / "metrics.json").exists() and not fc.get("overwrite", False):
+                fp = RS.fingerprint("wise", RS.file_stamp(lin), RS.file_stamp(ft), a, sorted(evals),
+                                    fc.get("max_eval_samples"))
+                if (out / "metrics.json").exists() and not pol.should_run(out, "wise", fp, "ft_wise"):
                     continue
+                pol.begin(out, "wise", fp)
                 try:
                     ck = wise_interpolate(lin, ft, a, out / "model.pt")
                     res = evaluate_checkpoint(m, ctx.encoder_kwargs(m, cfg), ck, evals, ctx.num_classes,
@@ -591,9 +737,11 @@ def run_wise(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str]) -> Non
                                               num_workers=int(cfg.get("num_workers", 0)),
                                               max_eval_samples=fc.get("max_eval_samples"), device=cfg.get("device"))
                     res.update(mode=name, variant=name, wise_alpha=a, wise_source=src, head=fc.get("head", "fcn"))
-                    (out / "metrics.json").write_text(json.dumps(res, indent=2))
+                    RS.write_json(out / "metrics.json", res, indent=2)
+                    pol.done(out, "wise", fp)
                     logger.info("[WISE] %s %s alpha=%.2f done", r.tag, m, a)
                 except Exception:
+                    pol.failed(out, "wise", traceback.format_exc())
                     logger.error("[WISE] %s %s %s failed\n%s", r.tag, m, name, traceback.format_exc())
 
 
@@ -605,7 +753,7 @@ def ft_variants(ctx: DatasetContext, cfg: Dict[str, Any], P: Dict[str, str], run
             if mode == "linear":
                 continue
             ck = Path(P["finetune_root"], ctx.name, run.tag, m, mode, "model.pt")
-            if not ck.exists():
+            if not (ck.exists() and ck.with_name("metrics.json").exists()):   # metrics.json = completed
                 continue
             n = ft_name(m, run.tag, mode)
             names.append(n)
@@ -731,7 +879,8 @@ def forgetting_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Di
                     g = ctxs[e["family"]]
                     cond = g.by_name[e["condition"]]
                     ov = dict(base_ov, **{ftn: dict(ft_ov[ftn])})
-                    embed_condition(g, cond, [pre, ftn], cfg, P, ov)  # pre is a no-op when cached
+                    embed_condition(g, cond, [pre], cfg, P, ov, stage="embed")      # no-op when cached
+                    embed_condition(g, cond, [ftn], cfg, P, ov, stage="ft_embed")
                     e.update(spec=_spec(cond), pre_kwargs=g.encoder_kwargs(pre, cfg), layerwise=k < lw_max)
                 jobs.append({"run": r.tag, "model": pre, "variant": variant, "ft_name": ftn,
                              "id_conditions": r.id_conditions or r.eval_conditions, "ood_conditions": r.ood_conditions,
@@ -743,7 +892,8 @@ def forgetting_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Di
                                                            "predictor_csvs", "geo_id")}
         logger.info("[FORGET] %s: %d jobs", name, len(jobs))
         run_forgetting(name, jobs, P["embed_dir"], P["work_dir"], P["out_dir"], P["finetune_root"], params,
-                       seed=int(cfg.get("seed", 0)), device=cfg.get("device"), predictors=_predictors(cfg, P, name))
+                       seed=int(cfg.get("seed", 0)), device=cfg.get("device"), predictors=_predictors(cfg, P, name),
+                       policy=RS.policy_from(cfg))
         if fc.get("geo_id", False) and gcfg.get("enabled", True):
             by_fam: Dict[str, Dict[str, set]] = {}
             for j in jobs:
@@ -751,16 +901,16 @@ def forgetting_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Di
                     d = by_fam.setdefault(e["family"], {"conds": set(), "models": set()})
                     d["conds"].add(e["condition"]); d["models"] |= {j["model"], j["ft_name"]}
             for fam, d in by_fam.items():
-                geo_id_stage(fam, sorted(d["conds"]), sorted(d["models"]), gcfg, P, f"{name}_retention_{fam}")
+                geo_id_stage(fam, sorted(d["conds"]), sorted(d["models"]), gcfg, P, f"{name}_retention_{fam}",
+                             cfg=cfg, stage="forgetting")
 
 
 def sequential_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str]) -> None:
     """``forgetting.sequential: [{name, steps: ["ftw:<tag>", "mados:mados-train"], models, mode, ...}]``."""
     from reptaxonomy.gfm.forgetting import run_sequential
     fc = dict(cfg.get("finetune", {}) or {})
-    hp = {k: fc[k] for k in ("head", "epochs", "batch_size", "lr", "backbone_lr_mult", "weight_decay",
-                             "unfreeze_fraction", "max_train_samples", "max_eval_samples", "early_stop_patience",
-                             "amp") if k in fc}
+    pol = RS.policy_from(cfg)
+    hp = {k: fc[k] for k in FT_HP_KEYS if k in fc}
     for chain in (cfg.get("forgetting", {}) or {}).get("sequential", []) or []:
         chain = dict(chain)
         steps, fams = [], []
@@ -790,7 +940,9 @@ def sequential_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Di
                            reg_weight=float(chain.get("reg_weight", 0.0)),
                            fisher_batches=int(chain.get("fisher_batches", 50)),
                            num_workers=int(cfg.get("num_workers", 0)), device=cfg.get("device"),
-                           seed=int(cfg.get("seed", 0)), overwrite=bool(chain.get("overwrite", False)))
+                           seed=int(cfg.get("seed", 0)),
+                           overwrite=bool(chain.get("overwrite", False)) or pol.overwrite("ft_sequential"),
+                           check_config=pol.check_config)
         except Exception:
             logger.error("[SEQ] %s failed\n%s", chain.get("name"), traceback.format_exc())
 
@@ -813,7 +965,12 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
                if (v or {}).get("enabled", True) and (not datasets or k in datasets)}
     ctxs = {k: DatasetContext(k, v) for k, v in ds_cfgs.items()}
     logger.info("mode=%s stages=%s datasets=%s models=%d", mode, stages, list(ctxs), len(models))
-    Path(P["work_dir"], "resolved_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    Path(P["work_dir"]).mkdir(parents=True, exist_ok=True)
+    RS.write_text(Path(P["work_dir"], "resolved_config.yaml"),
+                  yaml.safe_dump({k: v for k, v in cfg.items() if k != "_run_policy"}, sort_keys=False))
+    pol = cfg["_run_policy"] = RS.RunPolicy(cfg)
+    RS.set_root(cfg.get("root_dir", "./gfm_runs"))
+    logger.info("resume policy: %s", pol.to_dict())
 
     if "prepare" in stages or not load_plan_into(ctxs, P):
         prepare(ctxs, cfg, P, models)
@@ -831,12 +988,27 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
         if "cross_condition" in stages and (cfg.get("cross_condition", {}) or {}).get("enabled", True):
             cc = dict(cfg.get("cross_condition", {}) or {}); cc.pop("enabled", None)
             plan = write_plan(ctxs, cfg, P)["datasets"][name]
-            run_cross_condition(P["embed_dir"], P["work_dir"], P["out_dir"], name, plan["comparisons"],
-                                ctx.models, [c.name for c in conds], **cc)
+            unit = Path(P["out_dir"], "cross_condition", name)
+            cnames = [c.name for c in conds]
+            fp = RS.fingerprint("cross_condition", plan["comparisons"], ctx.models, cnames, cc,
+                                {f"{c}/{m}": embed_stamp(P, c, m) for c in cnames for m in ctx.models})
+            if pol.should_run(unit, "cross_condition", fp, "cross_condition"):
+                pol.begin(unit, "cross_condition", fp)
+                try:
+                    run_cross_condition(P["embed_dir"], P["work_dir"], P["out_dir"], name, plan["comparisons"],
+                                        ctx.models, cnames, **cc)
+                    pol.done(unit, "cross_condition", fp)
+                except Exception:
+                    pol.failed(unit, "cross_condition", traceback.format_exc())
+                    logger.error("[%s] cross_condition failed\n%s", name, traceback.format_exc())
+                    if cfg.get("fail_fast"):
+                        raise
+            else:
+                logger.info("[%s] cross_condition complete, skipped", name)
         gcfg = dict(cfg.get("geo_id", {}) or {})
         geo_on = bool(gcfg.get("enabled", True))
         if "geo_id" in stages and geo_on:
-            geo_id_stage(name, [c.name for c in conds], ctx.models, gcfg, P, name)
+            geo_id_stage(name, [c.name for c in conds], ctx.models, gcfg, P, name, cfg=cfg, stage="geo_id")
         if "synthesis" in stages:
             family_synthesis(ctx, [c.name for c in conds], ctx.models, cfg, P, P["rt_out"], f"{name}_pretrained",
                              _scratch_pairs(ctx.models))
@@ -857,18 +1029,20 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
             evals = [ctx.by_name[c] for c in r.eval_conditions if c in ctx.by_name and ctx.by_name[c].analyze]
             if "ft_embed" in stages:
                 for c in evals:
-                    embed_condition(ctx, c, ft_names, cfg, P, ov)
+                    embed_condition(ctx, c, ft_names, cfg, P, ov, stage="ft_embed")
             if "ft_pipeline" in stages:
                 pre = [p[0] for p in pairs]
                 for c in evals:
                     pipeline_condition(ctx, c, list(dict.fromkeys(pre + ft_names)), cfg, P,
-                                       os.path.join(P["rt_out_ft"], r.tag), ov, training_pairs=pairs)
+                                       os.path.join(P["rt_out_ft"], r.tag), ov, training_pairs=pairs,
+                                       stage="ft_pipeline")
             if "ft_geo_id" in stages and geo_on and gcfg.get("finetuned", True) and pairs:
                 geo_id_stage(name, [c.name for c in evals], list(dict.fromkeys([p[0] for p in pairs] + ft_names)),
-                             gcfg, P, f"{name}_{r.tag}_ft")
+                             gcfg, P, f"{name}_{r.tag}_ft", cfg=cfg, stage="ft_geo_id")
             if "ft_synthesis" in stages and pairs:
                 family_synthesis(ctx, [c.name for c in evals], list(dict.fromkeys([p[0] for p in pairs] + ft_names)),
-                                 cfg, P, os.path.join(P["rt_out_ft"], r.tag), f"{name}_{r.tag}_ft", pairs)
+                                 cfg, P, os.path.join(P["rt_out_ft"], r.tag), f"{name}_{r.tag}_ft", pairs,
+                                 stage="ft_synthesis")
         if "finetune_compare" in stages:
             runs = [{"tag": r.tag, "eval_conditions": [c for c in r.eval_conditions if c in ctx.by_name],
                      "id_conditions": r.id_conditions, "ood_conditions": r.ood_conditions} for r in ctx.runs]
@@ -888,7 +1062,7 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
 
 
 def geo_id_stage(name: str, conditions: Sequence[str], models: Sequence[str], gcfg: Dict[str, Any],
-                 P: Dict[str, str], tag: str) -> None:
+                 P: Dict[str, str], tag: str, cfg: Optional[Dict[str, Any]] = None, stage: str = "geo_id") -> None:
     """Geolocated ID for one dataset family; failures are logged, never fatal."""
     gcfg = {k: v for k, v in gcfg.items() if k not in ("enabled", "finetuned")}
     per_ds = (gcfg.pop("datasets", {}) or {}).get(name, {}) or {}
@@ -896,10 +1070,20 @@ def geo_id_stage(name: str, conditions: Sequence[str], models: Sequence[str], gc
     if params.pop("skip", False):
         return
     coords_csv = params.pop("coords_csv", None)
+    pol = RS.policy_from(cfg)
+    unit = Path(P["out_dir"], "geo_id", tag)
+    fp = RS.fingerprint("geo_id", list(conditions), list(models), params, RS.file_stamp(coords_csv) if coords_csv else None,
+                        {f"{c}/{m}": embed_stamp(P, c, m) for c in conditions for m in models})
+    if not pol.should_run(unit, "geo_id", fp, stage):
+        logger.info("[%s] geo_id complete, skipped", tag)
+        return
+    pol.begin(unit, "geo_id", fp)
     try:
         run_geo_id(P["embed_dir"], P["work_dir"], P["out_dir"], tag, conditions, models, params,
                    coords_csv=coords_csv)
+        pol.done(unit, "geo_id", fp)
     except Exception:
+        pol.failed(unit, "geo_id", traceback.format_exc())
         logger.error("[%s] geo_id failed:\n%s", tag, traceback.format_exc())
 
 
@@ -921,6 +1105,11 @@ def main() -> None:
     ap.add_argument("--device")
     ap.add_argument("--max-samples", type=int, help="cap chips per condition (smoke runs)")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="dotted overrides, YAML values")
+    ap.add_argument("--overwrite", nargs="*", metavar="STAGE",
+                    help="recompute even if complete: no value = everything, else stages or 'pipeline:<step>'. "
+                         "Restart an interrupted overwrite run WITHOUT this flag.")
+    ap.add_argument("--no-check-config", action="store_true",
+                    help="trust completion markers even if the configuration changed since")
     a = ap.parse_args()
     cfg = load_config(a.yaml)
     if a.mode:
@@ -942,6 +1131,10 @@ def main() -> None:
         for p in parts[:-1]:
             node = node.setdefault(p, {})
         node[parts[-1]] = yaml.safe_load(v)
+    if a.overwrite is not None:
+        cfg["overwrite"] = True if not a.overwrite else list(a.overwrite)
+    if a.no_check_config:
+        cfg["resume"] = dict(cfg.get("resume", {}) or {}, check_config=False)
     run(cfg, a.stages, a.datasets)
 
 

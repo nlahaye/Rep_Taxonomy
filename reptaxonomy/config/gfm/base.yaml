@@ -7,11 +7,21 @@ num_workers: 4
 log_level: INFO
 fail_fast: false
 
+# Restart / retry (reptaxonomy/util/run_state.py). After a kill or crash, re-run the same
+# command: completed units (_DONE.*.json markers, written last; atomic outputs) are skipped,
+# failed (_FAILED.*) / interrupted (_RUNNING.*) units are redone, fine-tunes resume from
+# their last epoch. Status: python -m reptaxonomy.util.run_state <root_dir> [--failed]
+overwrite: false                # false | true | [stage, ...] / "pipeline:<step>" (CLI: --overwrite [STAGE ...]);
+                                # restart an interrupted overwrite run WITHOUT it
+resume:
+  check_config: true            # recompute units whose configuration / upstream outputs changed
+  validate_files: true          # verify .npy completeness when adopting outputs from before markers existed
+
 # reptaxonomy -> pipelines.generate_embeddings.run_embedding_export (batch 1, reference path)
 # fast        -> batched GFMEncoder export (identical embd_<stem>.npy artifacts)
 embedding_backend: reptaxonomy
 embed_batch_size: 16
-overwrite_embeddings: false
+overwrite_embeddings: false     # legacy aliases of overwrite: [embed, ft_embed] / [prepare]
 overwrite_cache: false
 label_grid: 64                  # label caches are nearest-downsampled to <= 64 x 64
 
@@ -153,6 +163,8 @@ finetune:
   max_eval_samples: null
   early_stop_patience: 5
   amp: true
+  resume_training: true         # save train_state.pt each checkpoint_every epochs; a killed fine-tune resumes there
+  checkpoint_every: 1
   weight_change: true
   models: null                  # null -> every model used for the dataset; or a list (>= 2: pre+ft pipeline needs >= 3 models)
   runs: null                    # null -> every FT run built from the experiments; or list of tags

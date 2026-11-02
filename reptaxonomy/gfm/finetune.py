@@ -30,7 +30,9 @@ between the linear-probe run (pretrained encoder + LP head) and a fine-tuned run
 Outputs (``<out_root>/finetune/<dataset>/<run_tag>/<model>/<mode>/``)
 ---------------------------------------------------------------------
 model.pt          {"backbone": state_dict, "head": state_dict, "meta": {...}}
-metrics.json      per-condition mIoU / OA / macro-F1 / per-class IoU, train curve
+metrics.json      per-condition mIoU / OA / macro-F1 / per-class IoU, train curve, config_fingerprint
+                  (written last = completion marker)
+train_state.pt    only while training (resume_training): last epoch's full training state
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from torch.utils.data import DataLoader
 from reptaxonomy.gfm.datasets import IGNORE_INDEX, LABEL_KEY, REPSET_CLASSES
 from reptaxonomy.gfm.encoders import GFMEncoder
 from reptaxonomy.util.experiment_init_utils import build_forward_instruments_collate_fn
+from reptaxonomy.util import run_state as RS
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +284,7 @@ def wise_interpolate(pre_ckpt: str | Path, ft_ckpt: str | Path, alpha: float, ou
     meta = dict(b["meta"], mode=f"wise{alpha:.2f}", wise_alpha=float(alpha),
                 wise_from=[str(pre_ckpt), str(ft_ckpt)])
     out = Path(out_ckpt); out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"backbone": mix(a["backbone"], b["backbone"]), "head": mix(a["head"], b["head"]), "meta": meta}, out)
+    RS.torch_save({"backbone": mix(a["backbone"], b["backbone"]), "head": mix(a["head"], b["head"]), "meta": meta}, out)
     return out
 
 
@@ -313,20 +316,45 @@ def run_finetune(model_name: str, encoder_kwargs: Dict[str, Any], train: Dict[st
                  regularizer: Optional[str] = None, reg_weight: float = 0.0, fisher_path: Optional[str] = None,
                  lp_head_from: Optional[str] = None, lp_epochs: int = 0, lora_rank: int = 8,
                  lora_alpha: float = 16.0, lora_targets: Sequence[str] = ("qkv", "proj", "fc1", "fc2"),
-                 variant: Optional[str] = None) -> Dict[str, Any]:
+                 variant: Optional[str] = None, check_config: bool = True, resume_training: bool = True,
+                 checkpoint_every: int = 1) -> Dict[str, Any]:
     """Train one (model, mode) on ``train`` and evaluate on every eval condition.
 
     ``train`` / ``val`` / ``eval_conditions[name]`` are ``{"cls": ..., "kwargs": {...}}``.
     ``variant`` is the label written to metrics.json (defaults to ``mode``); see the
     module docstring for ``lpft`` / ``lora`` / ``regularizer``.
+
+    Restarts: ``metrics.json`` is written last and marks the run complete; it records a
+    ``config_fingerprint`` of the training configuration, and a completed run with a
+    different fingerprint is retrained when ``check_config``. With ``resume_training``
+    a ``train_state.pt`` (model, head, optimizer, scheduler, scaler, RNG, early-stop
+    state) is saved every ``checkpoint_every`` epochs, so a killed run continues from
+    its last saved epoch; it is deleted on completion.
     """
     out_dir = Path(out_dir)
     metrics_path = out_dir / "metrics.json"
     ckpt_path = out_dir / "model.pt"
+    state_path = out_dir / "train_state.pt"
+    enc_stamp = RS.file_stamp(encoder_kwargs["checkpoint"]) if encoder_kwargs.get("checkpoint") else None
+    fp = RS.fingerprint("finetune", model_name, encoder_kwargs, enc_stamp, train, val, num_classes, mode, head,
+                        epochs, batch_size, lr, backbone_lr_mult, weight_decay, unfreeze_fraction, max_train_samples,
+                        seed, early_stop_patience, amp, regularizer, reg_weight,
+                        RS.file_stamp(fisher_path) if fisher_path else None,
+                        RS.file_stamp(lp_head_from) if (mode == "lpft" and lp_head_from) else None, lp_epochs,
+                        (lora_rank, lora_alpha, list(lora_targets)) if mode == "lora" else None)
     if metrics_path.exists() and ckpt_path.exists() and not overwrite:
-        logger.info("Fine-tune exists, skipping: %s", out_dir)
-        return json.loads(metrics_path.read_text())
+        try:
+            done = json.loads(metrics_path.read_text())
+        except Exception:
+            done = None
+        if done is not None and (not check_config or done.get("config_fingerprint") in (None, fp)):
+            logger.info("Fine-tune exists, skipping: %s", out_dir)
+            return done
+        if done is not None:
+            logger.info("Fine-tune configuration changed, retraining: %s", out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        state_path.unlink(missing_ok=True)
     torch.manual_seed(seed); np.random.seed(seed)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -367,8 +395,37 @@ def run_finetune(model_name: str, encoder_kwargs: Dict[str, Any], train: Dict[st
     scaler = torch.amp.GradScaler("cuda", enabled=amp and dev.type == "cuda")
 
     best, best_state, bad, curve = -1.0, None, 0, []
-    t0 = time.time()
-    for ep in range(epochs):
+    t0, start_ep, stopped = time.time(), 0, False
+    if resume_training and state_path.exists():
+        try:
+            st = torch.load(state_path, map_location="cpu", weights_only=False)
+            if st.get("fingerprint") != fp:
+                logger.info("[%s|%s] train_state.pt is from another configuration, starting over", model_name, mode)
+            else:
+                enc.backbone.load_state_dict(st["backbone"]); seg.load_state_dict(st["head"])
+                opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"]); scaler.load_state_dict(st["scaler"])
+                best, best_state, bad, curve = st["best"], st["best_state"], st["bad"], st["curve"]
+                start_ep, stopped, t0 = st["epoch"] + 1, st.get("stopped", False), time.time() - st.get("elapsed", 0.0)
+                torch.set_rng_state(st["rng"]["torch"]); np.random.set_state(st["rng"]["numpy"])
+                if torch.cuda.is_available() and st["rng"].get("cuda") is not None:
+                    torch.cuda.set_rng_state_all(st["rng"]["cuda"])
+                logger.info("[%s|%s] resumed from epoch %d (%s)", model_name, mode, start_ep, state_path)
+        except Exception as exc:
+            logger.warning("[%s|%s] unreadable train_state.pt (%s), starting over", model_name, mode, exc)
+            best, best_state, bad, curve, start_ep, stopped = -1.0, None, 0, [], 0, False
+
+    def _save_state(ep: int, stopped_now: bool) -> None:
+        RS.torch_save({"fingerprint": fp, "epoch": ep, "stopped": stopped_now, "elapsed": time.time() - t0,
+                       "backbone": enc.backbone.state_dict(), "head": seg.state_dict(), "opt": opt.state_dict(),
+                       "sched": sched.state_dict(), "scaler": scaler.state_dict(), "best": best,
+                       "best_state": best_state, "bad": bad, "curve": curve,
+                       "rng": {"torch": torch.get_rng_state(), "numpy": np.random.get_state(),
+                               "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}},
+                      state_path)
+
+    for ep in range(start_ep, epochs):
+        if stopped:
+            break
         frozen = mode == "linear" or (mode == "lpft" and ep < lp_epochs)
         enc.train(not frozen); seg.train()
         if frozen:
@@ -408,8 +465,11 @@ def run_finetune(model_name: str, encoder_kwargs: Dict[str, Any], train: Dict[st
                           "head": {k: v.detach().cpu().clone() for k, v in seg.state_dict().items()}}
         else:
             bad += 1
-            if early_stop_patience and bad >= early_stop_patience:
-                break
+            stopped = bool(early_stop_patience and bad >= early_stop_patience)
+        if resume_training and (stopped or ep + 1 == epochs or (ep + 1) % max(1, int(checkpoint_every)) == 0):
+            _save_state(ep, stopped)
+        if stopped:
+            break
     if best_state is not None:
         enc.backbone.load_state_dict(best_state["backbone"]); seg.load_state_dict(best_state["head"])
     if mode == "lora":
@@ -417,14 +477,18 @@ def run_finetune(model_name: str, encoder_kwargs: Dict[str, Any], train: Dict[st
 
     results: Dict[str, Any] = {"model": model_name, "mode": mode, "variant": variant or mode, "head": head,
                                "regularizer": regularizer, "reg_weight": reg_weight, "epochs_run": len(curve),
-                               "train_seconds": time.time() - t0, "curve": curve, "conditions": {}}
+                               "train_seconds": time.time() - t0, "curve": curve, "conditions": {},
+                               "config_fingerprint": fp}
     for name, spec in eval_conditions.items():
         el = _loader(spec["cls"], spec["kwargs"], batch_size, False, num_workers, max_eval_samples)
         results["conditions"][name] = evaluate(enc, seg, el, num_classes, dev)
-    torch.save({"backbone": enc.backbone.state_dict(), "head": seg.state_dict(),
-                "meta": {"model": model_name, "mode": mode, "variant": variant or mode, "head": head,
-                         "num_classes": num_classes, "feature_channels": c}}, ckpt_path)
-    metrics_path.write_text(json.dumps(results, indent=2))
+    # model.pt then metrics.json (the completion marker), both atomic
+    metrics_path.unlink(missing_ok=True)
+    RS.torch_save({"backbone": enc.backbone.state_dict(), "head": seg.state_dict(),
+                   "meta": {"model": model_name, "mode": mode, "variant": variant or mode, "head": head,
+                            "num_classes": num_classes, "feature_channels": c}}, ckpt_path)
+    RS.write_json(metrics_path, results, indent=2)
+    state_path.unlink(missing_ok=True)
     return results
 
 

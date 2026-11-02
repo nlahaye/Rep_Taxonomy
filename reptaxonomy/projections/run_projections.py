@@ -23,6 +23,7 @@ from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader
 
 from reptaxonomy.util.general_utils import read_yaml
+from reptaxonomy.util import run_state as RS
 from reptaxonomy.util.experiment_init_utils import build_test_loader
 from reptaxonomy.util.artifacts import (
     ensure_dict,
@@ -113,7 +114,12 @@ def get_indices(
     os.makedirs(os.path.dirname(index_fname), exist_ok=True)
 
     if os.path.exists(index_fname):
-        return zarr.load(index_fname)
+        try:
+            cached = zarr.load(index_fname)
+            if cached is not None:
+                return cached
+        except Exception:   # interrupted write -> resample
+            logger.warning("Unreadable index cache %s, recomputing", index_fname)
 
     n_classes = int(cfg["dataset"]["num_classes"])
     ignore_class = int(cfg["dataset"]["ignore_index"])
@@ -133,7 +139,7 @@ def get_indices(
         selected.append(valid.astype(np.int32, copy=False))
 
     final_inds = np.concatenate(selected, axis=0) if selected else np.empty((0,), dtype=np.int32)
-    zarr.save(index_fname, final_inds)
+    RS.zarr_save(index_fname, final_inds)
     return final_inds
 
 
@@ -337,6 +343,17 @@ def lens_silhouette(X: np.ndarray, y: np.ndarray, metric: str, cfg: Dict[str, An
     return float(metrics.silhouette_score(X, y, metric=metric))
 
 
+def _load_reducer(path: str):
+    """Fitted reducer, or None if missing / unreadable (e.g. a run killed mid-dump)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        logger.warning("Unreadable reducer %s, refitting", path)
+        return None
+
+
 def fit_or_load_projection(
     embed: np.ndarray,
     cfg: Dict[str, Any],
@@ -347,10 +364,13 @@ def fit_or_load_projection(
         return normalize_native(embed, cfg.get("native_normalization", "l2"))
 
     reducer_fname = reducer_model_path(cfg, run_idx, projection)
+    # refit_projections is set by the step runner when this step reruns on changed inputs
+    if cfg.get("refit_projections") and os.path.exists(reducer_fname):
+        os.remove(reducer_fname)
 
     if projection == "umap":
-        if os.path.exists(reducer_fname):
-            reducer = joblib.load(reducer_fname)
+        reducer = _load_reducer(reducer_fname)
+        if reducer is not None:
             logger.info("UMAP projecting data %s", embed.shape)
             return reducer.transform(embed)
 
@@ -366,8 +386,8 @@ def fit_or_load_projection(
         proj = reducer.fit_transform(embed)
 
     elif projection == "pca":
-        if os.path.exists(reducer_fname):
-            reducer = joblib.load(reducer_fname)
+        reducer = _load_reducer(reducer_fname)
+        if reducer is not None:
             logger.info("Projecting PCs %s", embed.shape)
             return reducer.transform(embed)
 
@@ -376,8 +396,8 @@ def fit_or_load_projection(
         proj = reducer.fit_transform(embed)
 
     elif projection == "tsne":
-        if os.path.exists(reducer_fname):
-            reducer = joblib.load(reducer_fname)
+        reducer = _load_reducer(reducer_fname)
+        if reducer is not None:
             logger.info("TSNE projecting data %s", embed.shape)
             return reducer.transform(embed)
 
@@ -395,7 +415,7 @@ def fit_or_load_projection(
     else:
         raise ValueError(f"Unsupported projection: {projection}")
 
-    joblib.dump(reducer, reducer_fname)
+    RS.joblib_dump(reducer, reducer_fname)
     return proj
 
 
@@ -447,13 +467,13 @@ def build_projection_artifacts(
             # Native lens: full-dimensional (normalized) embeddings; no raster, no 2-D truncation.
             coords = projection_data
             tif_path = None
-            np.save(projection_save_path, coords.astype(np.float32, copy=False))
+            RS.save_npy(projection_save_path, coords.astype(np.float32, copy=False))
         else:
             coords = projection_data[:, :2]
             projection_2d = normalize_projection_for_raster(projection_data)
             tif_path = projection_label_tif_path(cfg, run_idx, projection, model_name=model_name)
             write_projection_label_tif(projection_2d, target_full, tif_path)
-            np.save(projection_save_path, coords)
+            RS.save_npy(projection_save_path, coords)
 
         silhouette = lens_silhouette(coords, target_full, metric, cfg, run_idx, projection)
 
@@ -579,8 +599,8 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
         embed_full = np.concatenate(embed_batches, axis=0)
         target_full = np.concatenate(target_batches, axis=0)
 
-        np.save(embed_subset_path(cfg, run_idx, model_name=model_name), embed_full)
-        np.save(target_subset_path(cfg, run_idx, model_name=model_name), target_full)
+        RS.save_npy(embed_subset_path(cfg, run_idx, model_name=model_name), embed_full)
+        RS.save_npy(target_subset_path(cfg, run_idx, model_name=model_name), target_full)
 
         sil_rows = build_projection_artifacts(cfg, run_idx, embed_full, target_full)
         all_sil_rows.extend(sil_rows)
