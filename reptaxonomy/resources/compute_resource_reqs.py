@@ -353,7 +353,7 @@ def measure_compression_and_inference_energy(
         output_dir=stats_dir,
         output_file=energy_csv,
         measure_power_secs=float(cfg.get("measure_power_secs", 1)),
-        log_level="error",
+        log_level=str(cfg.get("codecarbon_log_level", "error")),
     )
     latencies: List[float] = []
     n_images = 0
@@ -460,7 +460,10 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
     out_dir = ensure_dir(os.path.join(cfg["embed_dir"], dataset_name, model_name, "test"))
     stats_dir = ensure_dir(os.path.join(out_dir, "calflops_stats"))
 
-    tracker = EmissionsTracker(output_dir=stats_dir, output_file=f"{model_name}.emissions.csv")
+    # log_level "error": on DGX Spark (unified memory) NVML reports NotSupported for the power
+    # limit and memory queries; CodeCarbon handles both but logs a full traceback as a warning.
+    tracker = EmissionsTracker(output_dir=stats_dir, output_file=f"{model_name}.emissions.csv",
+                               log_level=str(cfg.get("codecarbon_log_level", "error")))
     per_signature_rows = []
 
     tracker.start()

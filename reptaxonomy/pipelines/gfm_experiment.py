@@ -1031,14 +1031,15 @@ THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUM
 
 
 def parallel_pipeline(name: str, conds: Sequence[Condition], cfg: Dict[str, Any], P: Dict[str, str],
-                      workers: int, threads: Optional[int] = None) -> List[str]:
-    """Run the pipeline stage of ``conds`` in ``workers`` child processes (one condition each).
+                      workers: int, threads: Optional[int] = None, stage: str = "pipeline") -> List[str]:
+    """Run the pipeline (or ft_pipeline) stage of ``conds`` in ``workers`` child processes (one condition each).
 
     Conditions are independent (own output / marker directories), so this is safe with the
     restart markers; each child is an ordinary ``gfm_experiment --stages pipeline --conditions
-    <cond>`` run on the resolved config. Largest conditions start first. Each child's math
-    libraries get ``threads`` threads (default: CPU count // workers). Logs:
-    work/_parallel/logs/<cond>.log. Returns the conditions whose child exited non-zero."""
+    <cond>`` run on the resolved config (``--stages ft_pipeline``: every fine-tuning run that
+    evaluates <cond>). Largest conditions start first. Each child's math libraries get ``threads``
+    threads (default: CPU count // workers). Logs: work/_parallel/logs/<cond>.log
+    (ft_pipeline: ft_pipeline__<cond>.log). Returns the conditions whose child exited non-zero."""
     ncpu = os.cpu_count() or 1
     threads = int(threads or max(1, ncpu // workers))
     pdir = Path(P["work_dir"], "_parallel")
@@ -1046,21 +1047,22 @@ def parallel_pipeline(name: str, conds: Sequence[Condition], cfg: Dict[str, Any]
     child_cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
     child_cfg.pop("base", None)
     child_cfg["pipeline_workers"] = 1
-    cfg_path = pdir / f"{name}.yaml"
+    tag = "" if stage == "pipeline" else f"{stage}__"
+    cfg_path = pdir / f"{name}{'_' + stage if tag else ''}.yaml"
     RS.write_text(cfg_path, yaml.safe_dump(child_cfg, sort_keys=False))
     env = dict(os.environ, **{k: str(threads) for k in THREAD_ENV})
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     queue = sorted(conds, key=lambda c: -_chips(P, c.name))
-    logger.info("[%s] pipeline on %d conditions with %d workers x %d threads", name, len(queue), workers, threads)
+    logger.info("[%s] %s on %d conditions with %d workers x %d threads", name, stage, len(queue), workers, threads)
     running: Dict[str, Tuple[subprocess.Popen, Any, float]] = {}
     failed: List[str] = []
     try:
         while queue or running:
             while queue and len(running) < workers:
                 c = queue.pop(0)
-                log = open(pdir / "logs" / f"{c.name}.log", "ab")
+                log = open(pdir / "logs" / f"{tag}{c.name}.log", "ab")
                 cmd = [sys.executable, "-m", "reptaxonomy.pipelines.gfm_experiment", "-y", str(cfg_path),
-                       "--stages", "pipeline", "--datasets", name, "--conditions", c.name]
+                       "--stages", stage, "--datasets", name, "--conditions", c.name]
                 running[c.name] = (subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env), log, time.time())
             time.sleep(2)
             for cn, (proc, log, t0) in list(running.items()):
@@ -1079,7 +1081,7 @@ def parallel_pipeline(name: str, conds: Sequence[Condition], cfg: Dict[str, Any]
             proc.terminate()
             log.close()
     if failed:
-        logger.error("[%s] pipeline children failed for %s (see %s)", name, failed, pdir / "logs")
+        logger.error("[%s] %s children failed for %s (see %s)", name, stage, failed, pdir / "logs")
     return failed
 
 
@@ -1161,17 +1163,31 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
         if "ft_wise" in stages and wise_names(cfg):
             run_wise(ctx, cfg, P)
         all_ft, all_pairs = [], []
+        # evaluation conditions follow the condition selection (datasets.<ds>.conditions, --conditions),
+        # so deferred conditions of a reduced setup are not embedded / analysed for the fine-tuned models
+        sel_names = {c.name for c in conds}
+        ft_jobs = []
         for r in ctx.runs:
             if (cfg.get("finetune", {}) or {}).get("runs") and r.tag not in cfg["finetune"]["runs"]:
                 continue
             ft_names, ft_ov, pairs = ft_variants(ctx, cfg, P, r)
             all_ft += ft_names; all_pairs += pairs
             ov = dict(base_ov, **ft_ov)
-            evals = [ctx.by_name[c] for c in r.eval_conditions if c in ctx.by_name and ctx.by_name[c].analyze]
+            evals = [ctx.by_name[c] for c in r.eval_conditions if c in ctx.by_name and c in sel_names]
+            ft_jobs.append((r, ft_names, ov, pairs, evals))
             if "ft_embed" in stages:
                 for c in evals:
                     embed_condition(ctx, c, ft_names, cfg, P, ov, stage="ft_embed")
-            if "ft_pipeline" in stages:
+        # ft_pipeline in parallel: one child per evaluation condition (all runs evaluating it)
+        par_ft = False
+        if "ft_pipeline" in stages and workers > 1:
+            pend = list(dict.fromkeys(c.name for _, _, _, pairs, evals in ft_jobs if pairs for c in evals))
+            if len(pend) > 1:
+                parallel_pipeline(name, [ctx.by_name[c] for c in pend], cfg, P, workers,
+                                  cfg.get("threads_per_worker"), stage="ft_pipeline")
+                par_ft = True
+        for r, ft_names, ov, pairs, evals in ft_jobs:
+            if "ft_pipeline" in stages and not par_ft:
                 pre = [p[0] for p in pairs]
                 for c in evals:
                     pipeline_condition(ctx, c, list(dict.fromkeys(pre + ft_names)), cfg, P,

@@ -1,0 +1,29 @@
+# FTW fine-tuning + forgetting variants on the reduced 7-model setup (tier-1 shift-task conditions).
+# Same root as ftw_pretrained_fast.yaml, so finished pretrained embeddings / outputs are reused.
+#
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/ftw_finetune_fast.yaml \
+#       --stages finetune ft_wise ft_embed ft_pipeline finetune_compare ft_geo_id ft_synthesis
+#
+# Three runs, each evaluated on its id_test / ood_test conditions (6 conditions -> parallel
+# ft_pipeline). Evaluation conditions follow the tier-1 condition selection of the fast config.
+# The forgetting stage runs in the joint root (ftw_mados_forgetting_fast.yaml).
+base: [ftw_pretrained_fast.yaml]
+mode: finetune_compare
+
+finetune:
+  epochs: 20
+  batch_size: 8
+  max_train_samples: 4000
+  runs: [ftw-germany-cambodia, ftw-south_africa-window, ftw-all-window]
+  modes: [linear, full, lpft, l2sp]
+  variants:
+    lpft: {mode: lpft}
+    l2sp: {mode: full, regularizer: l2sp, reg_weight: 1.0e-3}
+    lora: {mode: lora, lora_rank: 8, lora_alpha: 16}
+    full_lr3x: {mode: full, lr: 3.0e-4}
+  wise_ft: {enabled: true, source_variant: full, alphas: [0.25, 0.5, 0.75]}
+
+# ft_pipeline: 6 evaluation conditions; 4 x 3 threads next to MADOS's 2 x 2 (20 cores)
+pipeline_workers: 4
+threads_per_worker: 3
+num_workers: 4

@@ -1,0 +1,28 @@
+# MADOS fine-tuning + forgetting variants on the reduced 7-model setup. Same root as
+# mados_pretrained_fast.yaml, so finished pretrained embeddings / outputs are reused.
+#
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/mados_finetune_fast.yaml \
+#       --stages finetune ft_wise ft_embed ft_pipeline finetune_compare ft_geo_id ft_synthesis
+#
+# One fine-tuning run (mados-train; evaluated on mados__val / mados__test). The forgetting stage
+# needs cross-family retention sets (MADOS has no held-out conditions) -> run it in the joint root
+# (ftw_mados_forgetting_fast.yaml), not here.
+base: [mados_pretrained_fast.yaml]
+mode: finetune_compare
+
+finetune:
+  epochs: 30
+  batch_size: 8
+  # tier 1 update regimes; tier 2 (add later, finished fine-tunes are kept): lora, full_lr3x
+  modes: [linear, full, lpft, l2sp]
+  variants:
+    lpft: {mode: lpft}
+    l2sp: {mode: full, regularizer: l2sp, reg_weight: 1.0e-3}
+    lora: {mode: lora, lora_rank: 8, lora_alpha: 16}
+    full_lr3x: {mode: full, lr: 3.0e-4}
+  wise_ft: {enabled: true, source_variant: full, alphas: [0.25, 0.5, 0.75]}   # no training (weight interpolation)
+
+# ft_pipeline: 2 evaluation conditions -> 2 workers; light threads so the concurrent FTW run keeps the CPU
+pipeline_workers: 2
+threads_per_worker: 2
+num_workers: 2                 # data-loader workers per fine-tune (FTW fine-tunes may share the GPU)

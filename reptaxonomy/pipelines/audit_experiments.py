@@ -377,7 +377,7 @@ class Auditor:
                 self.audit_family_synthesis(name, [c.name for c in conds], ctx.models, self.P["rt_out"],
                                             f"{name}_pretrained", "synthesis")
             if self.mode == "finetune_compare":
-                self.audit_finetune_family(name, ctx, gcfg, geo_on)
+                self.audit_finetune_family(name, ctx, gcfg, geo_on, {c.name for c in conds})
         if self.mode == "finetune_compare":
             if self.on("forgetting"):
                 self.audit_forgetting()
@@ -567,7 +567,8 @@ class Auditor:
             det += "; resumes from train_state.pt"
         return st, det
 
-    def audit_finetune_family(self, name: str, ctx, gcfg: Dict[str, Any], geo_on: bool) -> None:
+    def audit_finetune_family(self, name: str, ctx, gcfg: Dict[str, Any], geo_on: bool,
+                              selected: Optional[set] = None) -> None:
         fc = self.cfg.get("finetune", {}) or {}
         runs = [r for r in ctx.runs if not (fc.get("runs") and r.tag not in fc["runs"])]
         ftm = G.ft_models(ctx, self.cfg)
@@ -612,7 +613,9 @@ class Auditor:
             ov = {n: dict((self.cfg.get("per_model_overrides", {}) or {}).get(n.split("__ft__")[0], {}) or {},
                           checkpoint=str(self.ft_dir(name, r.tag, *_split_ft(n, r.tag), ) / "model.pt"))
                   for n in ready}
-            evals = [ctx.by_name[c] for c in r.eval_conditions if c in ctx.by_name and ctx.by_name[c].analyze]
+            # as the driver: evaluation conditions follow the condition selection
+            evals = [ctx.by_name[c] for c in r.eval_conditions if c in ctx.by_name and ctx.by_name[c].analyze
+                     and (selected is None or c in selected)]
             if self.on("ft_embed"):
                 for c in evals:
                     for n in expected:
