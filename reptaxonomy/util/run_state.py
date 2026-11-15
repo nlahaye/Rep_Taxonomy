@@ -43,6 +43,7 @@ import json
 import os
 import shutil
 import socket
+import time
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Union
@@ -165,6 +166,17 @@ def npy_ok(path: PathLike) -> bool:
 _ROOTS: list = []
 
 
+def job_cap(n: int) -> int:
+    """Cap a step's thread/job count by REPTAX_MAX_JOBS (set per worker by parallel runs).
+
+    Runtime only: step configs (and therefore completion fingerprints) are unchanged."""
+    cap = os.environ.get("REPTAX_MAX_JOBS")
+    if not cap:
+        return n
+    cap = max(1, int(cap))
+    return cap if n is None or int(n) < 0 else min(int(n), cap)
+
+
 def set_root(root: PathLike) -> None:
     """Fingerprints treat paths under ``root`` as root-relative (moved/symlinked roots stay valid)."""
     forms = {str(root), os.path.abspath(str(root)), os.path.realpath(str(root))}
@@ -258,6 +270,7 @@ class RunPolicy:
     """
 
     def __init__(self, cfg: Optional[Mapping[str, Any]] = None) -> None:
+        self._t0: Dict[str, float] = {}
         cfg = dict(cfg or {})
         ow = cfg.get("overwrite", False)
         self.all = ow is True
@@ -324,8 +337,12 @@ class RunPolicy:
     def begin(self, unit_dir: PathLike, key: str = "unit", fp: Optional[str] = None) -> None:
         marker_path(unit_dir, key).unlink(missing_ok=True)
         mark_running(unit_dir, key, fp)
+        self._t0[self._id(unit_dir, key)] = time.time()
 
     def done(self, unit_dir: PathLike, key: str = "unit", fp: Optional[str] = None, **info: Any) -> None:
+        t0 = self._t0.pop(self._id(unit_dir, key), None)
+        if t0 is not None and "seconds" not in info:
+            info["seconds"] = round(time.time() - t0, 1)   # read by audit_experiments --timings
         mark_done(unit_dir, key, fp, **info)
         self._session.add(self._id(unit_dir, key))
 

@@ -36,6 +36,7 @@ from sklearn import metrics
 from sklearn.decomposition import PCA
 
 from reptaxonomy.util.general_utils import read_yaml
+from reptaxonomy.util import run_state as RS
 from reptaxonomy.util.artifacts import (
     ensure_dict,
     get_model_names,
@@ -134,7 +135,7 @@ def fit_lens(X: np.ndarray, lens: str, cfg: Dict[str, Any]) -> np.ndarray:
                          spread=float(cfg.get("umap_spread", 1.0)), random_state=seed).fit_transform(X)
     if lens == "tsne":
         import openTSNE
-        emb = openTSNE.TSNE(n_jobs=int(cfg.get("tsne_n_jobs", 8)), metric="cosine",
+        emb = openTSNE.TSNE(n_jobs=RS.job_cap(int(cfg.get("tsne_n_jobs", 8))), metric="cosine",
                             exaggeration=4, random_state=seed).fit(X)
         return np.asarray(emb)
     raise ValueError(f"Unsupported lens {lens}")

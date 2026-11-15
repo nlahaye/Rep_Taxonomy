@@ -92,7 +92,11 @@ import copy
 import csv
 import json
 import logging
+import fnmatch
 import os
+import subprocess
+import sys
+import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
@@ -354,8 +358,15 @@ def prepare(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, s
 
 
 def write_plan(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str]) -> Dict[str, Any]:
+    """Write work/plan.json. Entries of dataset families not in ``ctxs`` are kept, so separate
+    runs (e.g. FTW and MADOS configs) can share one root_dir without erasing each other's plan."""
     plan = {"embed_dir": P["embed_dir"], "work_dir": P["work_dir"], "out_dir": P["out_dir"],
             "finetune_root": P["finetune_root"], "datasets": {}}
+    try:
+        old = json.loads(Path(P["work_dir"], "plan.json").read_text()).get("datasets", {}) or {}
+        plan["datasets"].update({k: v for k, v in old.items() if k not in ctxs})
+    except Exception:
+        pass
     for name, ctx in ctxs.items():
         plan["datasets"][name] = {
             "source_bands": ctx.source_bands, "sensor": ctx.sensor, "gsd": ctx.gsd, "raw_scale": ctx.raw_scale,
@@ -373,7 +384,10 @@ def write_plan(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str
     return plan
 
 
-def load_plan_into(ctxs: Dict[str, DatasetContext], P: Dict[str, str]) -> bool:
+def load_plan_into(ctxs: Dict[str, DatasetContext], P: Dict[str, str],
+                   models: Optional[Sequence[str]] = None) -> bool:
+    """Restore prepare's results. ``models`` (the configured suite) restricts the plan's models,
+    so a smaller suite needs no new prepare run."""
     p = Path(P["work_dir"], "plan.json")
     try:
         plan = json.loads(p.read_text())
@@ -386,6 +400,11 @@ def load_plan_into(ctxs: Dict[str, DatasetContext], P: Dict[str, str]) -> bool:
         ctx.source_bands, ctx.sensor, ctx.gsd = d["source_bands"], d["sensor"], d["gsd"]
         ctx.raw_scale, ctx.num_classes, ctx.band_stats = d["raw_scale"], d["num_classes"], d["band_stats"]
         ctx.models, ctx.coverage = d["models"], d["coverage"]
+        if models is not None:
+            missing = [m for m in models if m not in ctx.models and m not in ctx.coverage]
+            if missing:   # never assessed by prepare -> run prepare for them
+                return False
+            ctx.models = [m for m in ctx.models if m in set(models)]
         analysed = set(d["analysed"])
         for c in ctx.conditions:
             c.analyze = c.name in analysed
@@ -533,6 +552,59 @@ def _embed_fast(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Di
 
 
 # ----------------------------------------------------------------------------- full pipeline
+def _chips(P: Dict[str, str], cond: str) -> int:
+    try:
+        return len(_stems(P, cond))
+    except Exception:
+        return 0
+
+
+def select_conditions(ctx: DatasetContext, P: Dict[str, str], patterns: Optional[Sequence[str]] = None,
+                      log: bool = True) -> List[Condition]:
+    """Analysed conditions restricted by ``datasets.<ds>.conditions`` and ``--conditions``.
+
+    ``conditions: {include: [glob, ...], exclude: [glob, ...], min_chips: N}`` -- excluded
+    conditions stay in the plan (and keep their outputs); they are just not processed by this
+    run, so they can be run later by removing the exclusion."""
+    sel = dict(ctx.cfg.get("conditions", {}) or {})
+    inc, exc = list(sel.get("include", []) or []), list(sel.get("exclude", []) or [])
+    min_chips = int(sel.get("min_chips", 0) or 0)
+    out, dropped = [], []
+    for c in ctx.analysed:
+        keep = (not inc or any(fnmatch.fnmatchcase(c.name, g) for g in inc)) \
+            and not any(fnmatch.fnmatchcase(c.name, g) for g in exc) \
+            and (not patterns or any(fnmatch.fnmatchcase(c.name, g) for g in patterns))
+        if keep and min_chips and 0 < _chips(P, c.name) < min_chips:
+            keep = False
+        (out if keep else dropped).append(c)
+    if log and dropped and not patterns:
+        logger.info("[%s] %d of %d conditions deferred by the condition selection: %s", ctx.name, len(dropped),
+                    len(dropped) + len(out), [c.name for c in dropped])
+    return out
+
+
+def _condition_overrides(ctx: DatasetContext, cond: Condition, state_dir: Path) -> Dict[str, Any]:
+    """``datasets.<ds>.pipeline_overrides: [{match: [glob], pipeline: {...}, only_unstarted: true}]``.
+
+    Deep-merged into the pipeline config of matching conditions. With ``only_unstarted`` (default)
+    an override is ignored for conditions that already have completed steps, so every model of a
+    condition is always evaluated with the same settings."""
+    started = None
+    out: Dict[str, Any] = {}
+    for ov in ctx.cfg.get("pipeline_overrides", []) or []:
+        if not any(fnmatch.fnmatchcase(cond.name, g) for g in (ov.get("match") or ["*"])):
+            continue
+        if ov.get("only_unstarted", True):
+            if started is None:
+                started = state_dir.is_dir() and any(state_dir.glob(f"{RS.DONE_PREFIX}*"))
+            if started:
+                logger.warning("[PIPELINE] %s: has completed steps; pipeline_overrides %s not applied",
+                               cond.name, ov.get("name") or ov.get("match"))
+                continue
+        out = deep_merge(out, copy.deepcopy(ov.get("pipeline", {}) or {}))
+    return out
+
+
 def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], cfg: Dict[str, Any],
                        P: Dict[str, str], out_root: str, overrides: Dict[str, Dict[str, Any]],
                        training_pairs: Sequence[Sequence[str]] = (), stage: str = "pipeline") -> None:
@@ -549,6 +621,10 @@ def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], 
         return
     dataset, dataset_init = ctx.dataset_cfg(cond)
     pcfg = copy.deepcopy(cfg.get("pipeline", {}) or {})
+    cov = _condition_overrides(ctx, cond, Path(out_root, "_state", cond.name))
+    if cov:
+        logger.info("[PIPELINE] %s: condition overrides %s", cond.name, cov)
+        pcfg = deep_merge(pcfg, cov)
     pcfg.update({
         "dataset": dataset, "dataset_init": dataset_init, "model_names": present,
         "model_init": dict(cfg.get("model_init", {}) or {}),
@@ -573,6 +649,8 @@ def pipeline_condition(ctx: DatasetContext, cond: Condition, models: List[str], 
     pcfg["_run_policy"], pcfg["_stage"] = pol, stage
     pcfg["_state_dir"] = str(Path(out_root, "_state", cond.name))
     pcfg["_upstream"] = {m: embed_stamp(P, cond.name, m) for m in present}
+    pcfg["_share_root"] = str(Path(P["embed_dir"], "_shared", ctx.name))
+    pcfg.setdefault("fail_fast", bool(cfg.get("fail_fast", False)))
     try:
         run_full_pipeline(pcfg)
     except Exception:
@@ -948,7 +1026,65 @@ def sequential_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Di
 
 
 # ----------------------------------------------------------------------------- driver
-def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: Optional[Sequence[str]] = None) -> None:
+THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+              "NUMBA_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "REPTAX_MAX_JOBS")
+
+
+def parallel_pipeline(name: str, conds: Sequence[Condition], cfg: Dict[str, Any], P: Dict[str, str],
+                      workers: int, threads: Optional[int] = None) -> List[str]:
+    """Run the pipeline stage of ``conds`` in ``workers`` child processes (one condition each).
+
+    Conditions are independent (own output / marker directories), so this is safe with the
+    restart markers; each child is an ordinary ``gfm_experiment --stages pipeline --conditions
+    <cond>`` run on the resolved config. Largest conditions start first. Each child's math
+    libraries get ``threads`` threads (default: CPU count // workers). Logs:
+    work/_parallel/logs/<cond>.log. Returns the conditions whose child exited non-zero."""
+    ncpu = os.cpu_count() or 1
+    threads = int(threads or max(1, ncpu // workers))
+    pdir = Path(P["work_dir"], "_parallel")
+    (pdir / "logs").mkdir(parents=True, exist_ok=True)
+    child_cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    child_cfg.pop("base", None)
+    child_cfg["pipeline_workers"] = 1
+    cfg_path = pdir / f"{name}.yaml"
+    RS.write_text(cfg_path, yaml.safe_dump(child_cfg, sort_keys=False))
+    env = dict(os.environ, **{k: str(threads) for k in THREAD_ENV})
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    queue = sorted(conds, key=lambda c: -_chips(P, c.name))
+    logger.info("[%s] pipeline on %d conditions with %d workers x %d threads", name, len(queue), workers, threads)
+    running: Dict[str, Tuple[subprocess.Popen, Any, float]] = {}
+    failed: List[str] = []
+    try:
+        while queue or running:
+            while queue and len(running) < workers:
+                c = queue.pop(0)
+                log = open(pdir / "logs" / f"{c.name}.log", "ab")
+                cmd = [sys.executable, "-m", "reptaxonomy.pipelines.gfm_experiment", "-y", str(cfg_path),
+                       "--stages", "pipeline", "--datasets", name, "--conditions", c.name]
+                running[c.name] = (subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env), log, time.time())
+            time.sleep(2)
+            for cn, (proc, log, t0) in list(running.items()):
+                if proc.poll() is None:
+                    continue
+                log.close()
+                del running[cn]
+                ok = proc.returncode == 0
+                if not ok:
+                    failed.append(cn)
+                logger.info("[%s] %s %s in %.1f min (%d left, %d running)", name, cn,
+                            "finished" if ok else f"exited {proc.returncode}", (time.time() - t0) / 60,
+                            len(queue), len(running))
+    finally:
+        for proc, log, _ in running.values():   # parent interrupted: stop the children
+            proc.terminate()
+            log.close()
+    if failed:
+        logger.error("[%s] pipeline children failed for %s (see %s)", name, failed, pdir / "logs")
+    return failed
+
+
+def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: Optional[Sequence[str]] = None,
+        conditions: Optional[Sequence[str]] = None) -> None:
     logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     mode = cfg.get("mode", "pretrained")
@@ -972,30 +1108,35 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
     RS.set_root(cfg.get("root_dir", "./gfm_runs"))
     logger.info("resume policy: %s", pol.to_dict())
 
-    if "prepare" in stages or not load_plan_into(ctxs, P):
+    if "prepare" in stages or not load_plan_into(ctxs, P, models):
         prepare(ctxs, cfg, P, models)
     base_ov = {m: dict(v or {}) for m, v in (cfg.get("per_model_overrides", {}) or {}).items()}
 
+    workers = int(cfg.get("pipeline_workers", 1) or 1)
     for name, ctx in ctxs.items():
-        conds = ctx.analysed
+        conds = select_conditions(ctx, P, conditions)
         if "embed" in stages:
             for c in conds:
                 embed_condition(ctx, c, ctx.models, cfg, P, base_ov)
         if "pipeline" in stages:
-            for c in conds:
-                pipeline_condition(ctx, c, ctx.models, cfg, P, P["rt_out"], base_ov,
-                                   training_pairs=_scratch_pairs(ctx.models))
+            if workers > 1 and len(conds) > 1:
+                parallel_pipeline(name, conds, cfg, P, workers, cfg.get("threads_per_worker"))
+            else:
+                for c in conds:
+                    pipeline_condition(ctx, c, ctx.models, cfg, P, P["rt_out"], base_ov,
+                                       training_pairs=_scratch_pairs(ctx.models))
         if "cross_condition" in stages and (cfg.get("cross_condition", {}) or {}).get("enabled", True):
             cc = dict(cfg.get("cross_condition", {}) or {}); cc.pop("enabled", None)
             plan = write_plan(ctxs, cfg, P)["datasets"][name]
             unit = Path(P["out_dir"], "cross_condition", name)
             cnames = [c.name for c in conds]
-            fp = RS.fingerprint("cross_condition", plan["comparisons"], ctx.models, cnames, cc,
+            comps = [c for c in plan["comparisons"] if c["a"] in cnames and c["b"] in cnames]
+            fp = RS.fingerprint("cross_condition", comps, ctx.models, cnames, cc,
                                 {f"{c}/{m}": embed_stamp(P, c, m) for c in cnames for m in ctx.models})
             if pol.should_run(unit, "cross_condition", fp, "cross_condition"):
                 pol.begin(unit, "cross_condition", fp)
                 try:
-                    run_cross_condition(P["embed_dir"], P["work_dir"], P["out_dir"], name, plan["comparisons"],
+                    run_cross_condition(P["embed_dir"], P["work_dir"], P["out_dir"], name, comps,
                                         ctx.models, cnames, **cc)
                     pol.done(unit, "cross_condition", fp)
                 except Exception:
@@ -1108,9 +1249,18 @@ def main() -> None:
     ap.add_argument("--overwrite", nargs="*", metavar="STAGE",
                     help="recompute even if complete: no value = everything, else stages or 'pipeline:<step>'. "
                          "Restart an interrupted overwrite run WITHOUT this flag.")
+    ap.add_argument("--conditions", nargs="*", metavar="GLOB",
+                    help="only these conditions (glob patterns), on top of datasets.<ds>.conditions")
+    ap.add_argument("--workers", type=int, help="pipeline stage: conditions processed in parallel (pipeline_workers)")
+    ap.add_argument("--threads-per-worker", type=int, help="math-library threads per worker (default cpus // workers)")
     ap.add_argument("--no-check-config", action="store_true",
                     help="trust completion markers even if the configuration changed since")
     a = ap.parse_args()
+    # REPTAX_PRELOAD=mod[,mod]: imported first (custom dataset / model registrations); inherited by
+    # the child processes of a parallel pipeline run
+    import importlib
+    for mod in filter(None, os.environ.get("REPTAX_PRELOAD", "").split(",")):
+        importlib.import_module(mod.strip())
     cfg = load_config(a.yaml)
     if a.mode:
         cfg["mode"] = a.mode
@@ -1135,7 +1285,11 @@ def main() -> None:
         cfg["overwrite"] = True if not a.overwrite else list(a.overwrite)
     if a.no_check_config:
         cfg["resume"] = dict(cfg.get("resume", {}) or {}, check_config=False)
-    run(cfg, a.stages, a.datasets)
+    if a.workers:
+        cfg["pipeline_workers"] = a.workers
+    if a.threads_per_worker:
+        cfg["threads_per_worker"] = a.threads_per_worker
+    run(cfg, a.stages, a.datasets, a.conditions)
 
 
 if __name__ == "__main__":

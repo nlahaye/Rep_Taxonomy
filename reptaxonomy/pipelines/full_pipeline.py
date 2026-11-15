@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,6 +33,8 @@ from reptaxonomy.util.experiment_init_utils import (
     serialize_dataset_bundle,
     serialize_model_bundle,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_dict(cfg: Any, name: str = "config") -> Dict[str, Any]:
@@ -167,6 +170,11 @@ def call_step(step_name: str, fn, cfg: Dict[str, Any]) -> None:
 # Steps whose outputs do not depend on how token grids are upsampled to pixels.
 UPSAMPLE_INDEPENDENT_STEPS = {"compute_resource_reqs", "weight_matrix_analysis"}
 
+# Steps whose outputs depend on the model weights only (not on the condition's data). With
+# ``share_across_conditions: [<step>, ...]`` they run once per model and dataset family; other
+# conditions receive a copy of the outputs (sub-directories of embed_dir/<cond>/<model>/test).
+SHAREABLE_STEP_OUTPUTS = {"weight_matrix_analysis": ["ww_stats", "ww_plots"]}
+
 # Global steps that are evaluated once on the primary variant only.
 PRIMARY_ONLY_GLOBAL_STEPS = {"invariance_checks"}
 
@@ -190,6 +198,42 @@ class StepState:
     method: str = ""
     upstream: Dict[str, Any] = field(default_factory=dict)
     force: bool = False
+    share_root: str | None = None          # cache of condition-independent step outputs
+    shared_steps: frozenset = frozenset()
+
+
+def _share_paths(step_name: str, model: str, step_cfg: Dict[str, Any], cfg: Dict[str, Any],
+                 state: "StepState") -> tuple[Path, Path]:
+    sfp = RS.fingerprint(step_name, model, step_cfg, cfg.get("model_init"),
+                         (cfg.get("per_model_overrides") or {}).get(model))
+    dest = Path(cfg["embed_dir"], str(cfg["dataset"]["dataset_name"]), model, "test")
+    return Path(state.share_root, step_name, model, sfp), dest
+
+
+def _copy_outputs(step_name: str, src: Path, dst: Path) -> bool:
+    subs = [d for d in SHAREABLE_STEP_OUTPUTS[step_name] if (src / d).is_dir()]
+    if not subs:
+        return False
+    for d in subs:
+        shutil.copytree(src / d, dst / d, dirs_exist_ok=True)
+    return True
+
+
+def _publish_shared(step_name: str, cache: Path, dest: Path) -> None:
+    """Store a condition's outputs as the shared copy (first writer wins)."""
+    if RS.read_marker(cache, "shared") is not None:
+        return
+    tmp = cache.with_name(cache.name + f".tmp{os.getpid()}")
+    try:
+        if _copy_outputs(step_name, dest, tmp):
+            RS.mark_done(tmp, "shared", source=str(dest))
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.rename(tmp, cache)
+            except OSError:   # another worker published first
+                pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_step_block(
@@ -230,8 +274,21 @@ def run_step_block(
             parts.append(("pixelshuffle_factor", cfg.get("pixelshuffle_factor")))
         fp = RS.fingerprint(*parts)
         pol = state.policy
+        shared = bool(model and state.share_root and step_name in state.shared_steps
+                      and step_name in SHAREABLE_STEP_OUTPUTS)
+        cache = dest = None
+        if shared:
+            cache, dest = _share_paths(step_name, model, step_cfg, cfg, state)
         if not state.force and not pol.should_run(state.state_dir, key, fp, state.stage, step_name):
             print(f"[PIPELINE] Skipping step={step_name} model={model or 'global'} variant={state.method}: complete")
+            if shared:
+                _publish_shared(step_name, cache, dest)
+            continue
+        if shared and not pol.overwrite(state.stage, step_name) and RS.read_marker(cache, "shared") is not None \
+                and _copy_outputs(step_name, cache, dest):
+            print(f"[PIPELINE] step={step_name} model={model}: copied condition-independent outputs from {cache}")
+            pol.done(state.state_dir, key, fp, shared_from=str(cache))
+            ran = True
             continue
         if state.force or pol.is_stale(state.state_dir, key, fp, state.stage, step_name) \
                 or RS.read_marker(state.state_dir, key) is not None:
@@ -244,6 +301,8 @@ def run_step_block(
             pol.failed(state.state_dir, key, traceback.format_exc() if isinstance(exc, Exception) else repr(exc))
             raise
         pol.done(state.state_dir, key, fp)
+        if shared:
+            _publish_shared(step_name, cache, dest)
         ran = True
     return ran
 
@@ -321,6 +380,10 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
         upstream = {m: _embed_dir_stamp(cfg["embed_dir"], dataset_name, m, str(cfg["dataset"].get("split", "test")))
                     for m in cfg["model_names"]}
     state_dir = state_dir or os.path.join(base_out_dir, "_state", str(dataset_name))
+    share_root = cfg.get("_share_root")
+    shared_steps = frozenset(cfg.get("share_across_conditions") or [])
+    fail_fast = bool(cfg.get("fail_fast", False))
+    failed: Dict[str, str] = {}    # model -> error; the other models (and global steps) still run
     any_ran = False
 
     for method in methods:
@@ -335,17 +398,35 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
 
         per_ran = False
         for model_name, model_bundle in model_bundles.items():
+            if model_name in failed:
+                continue
             model_cfg = attach_bundles_to_cfg(variant_cfg, dataset_bundle, model_bundle)
             model_cfg["encoder"] = model_name
-            per_ran |= run_step_block(
-                per_model_steps, cfg, model_cfg, model_bundle=model_bundle,
-                skip=None if method == primary else UPSAMPLE_INDEPENDENT_STEPS,
-                state=StepState(policy, stage, state_dir, method, upstream),
-            )
+            try:
+                per_ran |= run_step_block(
+                    per_model_steps, cfg, model_cfg, model_bundle=model_bundle,
+                    skip=None if method == primary else UPSAMPLE_INDEPENDENT_STEPS,
+                    state=StepState(policy, stage, state_dir, method, upstream,
+                                    share_root=share_root, shared_steps=shared_steps),
+                )
+            except Exception as exc:
+                if fail_fast:
+                    raise
+                failed[model_name] = f"{type(exc).__name__}: {exc}"
+                logger.error("[PIPELINE] %s / %s failed (%s); continuing with the other models",
+                             dataset_name, model_name, failed[model_name])
 
+        ok = [m for m in cfg["model_names"] if m not in failed]
+        if len(ok) < 3:
+            logger.error("[PIPELINE] %s: %d model(s) left after failures; global steps skipped", dataset_name, len(ok))
+            break
+        gcfg, gvar = cfg, copy.deepcopy(variant_cfg)
+        if failed:   # global steps on the models that completed (their fingerprint records the set)
+            gcfg = dict(cfg, model_names=ok)
+            gvar["model_names"] = ok
         # global steps read per-model outputs: rerun them whenever a per-model step reran
         glob_ran = run_step_block(
-            global_steps, cfg, copy.deepcopy(variant_cfg),
+            global_steps, gcfg, gvar,
             skip=None if method == primary else PRIMARY_ONLY_GLOBAL_STEPS,
             state=StepState(policy, stage, state_dir, method, upstream, force=per_ran),
         )
@@ -357,8 +438,17 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
     syn.setdefault("variants", variants)
     syn.setdefault("primary_variant", primary)
     final_cfg["synthesis"] = syn
-    run_step_block(final_steps, cfg, final_cfg,
-                   state=StepState(policy, stage, state_dir, "", upstream, force=any_ran))
+    ok = [m for m in cfg["model_names"] if m not in failed]
+    if len(ok) >= 3:
+        fcfg = cfg
+        if failed:
+            fcfg = dict(cfg, model_names=ok)
+            final_cfg["model_names"] = ok
+        run_step_block(final_steps, fcfg, final_cfg,
+                       state=StepState(policy, stage, state_dir, "", upstream, force=any_ran))
+    if failed:
+        raise RuntimeError(f"{dataset_name}: per-model steps failed for {len(failed)} model(s) (rerun retries "
+                           f"them): " + "; ".join(f"{m}: {e}" for m, e in failed.items()))
 
 
 def main() -> None:

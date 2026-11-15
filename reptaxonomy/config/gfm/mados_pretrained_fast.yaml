@@ -1,0 +1,8 @@
+# MADOS, reduced setup (same 7 models / single variant as FTW). 3 conditions -> 3 workers.
+# Run alongside the FTW run: 3 workers x 1 thread next to FTW's 4 x 4.
+#
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/mados_pretrained_fast.yaml \
+#       --stages pipeline cross_condition geo_id synthesis
+base: [mados_pretrained.yaml, fast_common.yaml]
+pipeline_workers: 3
+threads_per_worker: 1

@@ -255,7 +255,9 @@ def build_main_metric_summary(demsar_input_files: list[Path], output_csv: Path) 
         df["source_file"] = path.name
         parts.append(df)
     if parts:
-        pd.concat(parts, ignore_index=True).to_csv(output_csv, index=False)
+        from reptaxonomy.util import run_state as RS
+        # atomic: conditions running in parallel share this output directory
+        RS.to_csv(pd.concat(parts, ignore_index=True), output_csv, index=False)
 
 
 def load_yaml_config(path: Path) -> dict[str, Any]:
@@ -283,6 +285,11 @@ def demsar_wrapper(cfg):
     build_main_metric_summary(
         demsar_input_files=written_files,
         output_csv=out_dir / "demsar_inputs" / "all_metrics_mean_std_summary.csv",
+    )
+    # per-condition copy (the shared file above holds whichever condition finished last)
+    build_main_metric_summary(
+        demsar_input_files=written_files,
+        output_csv=out_dir / "demsar_inputs" / f"all_metrics_mean_std_summary.{dataset_name}.csv",
     )
 
     for metric_cfg in metric_specs:

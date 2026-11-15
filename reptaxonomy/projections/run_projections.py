@@ -78,7 +78,7 @@ def build_sparse_knn_graph(
     symmetrize: bool = True,
 ) -> csr_array:
     n_neighbors = min(k + 1, X.shape[0])
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, n_jobs=-1)
+    nn = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, n_jobs=RS.job_cap(-1))
     nn.fit(X)
     _, indices = nn.kneighbors(X, return_distance=True)
 
@@ -442,7 +442,7 @@ def fit_or_load_projection(
 
         logger.info("Training TSNE and projecting data %s", embed.shape)
         reducer = openTSNE.TSNE(
-            n_jobs=int(cfg.get("tsne_n_jobs", 8)),
+            n_jobs=RS.job_cap(int(cfg.get("tsne_n_jobs", 8))),
             verbose=True,
             metric="cosine",
             exaggeration=4,

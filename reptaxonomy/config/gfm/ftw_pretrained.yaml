@@ -1,14 +1,14 @@
 # Fields of the World: pretrained-only representation evaluation across splits / countries / seasons.
 base: base.yaml
 mode: pretrained
-root_dir: ./gfm_runs/ftw
+root_dir: /data/datasets/ftw_experiments/
 
 datasets:
   ftw:
     num_classes: 3                       # background / field / boundary (3 = unknown -> ignore)
     band_stats: {source: default}        # EarthShift FTW statistics (fixed across conditions)
     data:
-      data_root: /mnt/data/ftw
+      data_root: /data/datasets/FTW
       reflectance_scale: 1.0             # raw DN; band stats are scaled accordingly
       max_samples: 500                   # chips per condition (hash-stable subsample)
     experiments:

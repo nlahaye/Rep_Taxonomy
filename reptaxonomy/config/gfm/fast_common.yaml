@@ -1,0 +1,43 @@
+# Reduced, faster setup shared by ftw_pretrained_fast.yaml / mados_pretrained_fast.yaml.
+# Use it as an extra base AFTER the dataset config (keeps root_dir and all finished work).
+# Nothing here changes the configuration of per-model steps that have already completed, so
+# their completion markers stay valid; only steps that have never run get lighter settings.
+
+# (1) one variant per model family (7 models); the base / large / scratch / alternative
+#     pre-training variants can be added back later (models.suite), finished work is kept.
+models:
+  suite:
+    - croma_base__croma_vit
+    - dofa_base__dofa_mae
+    - prithvi_eo1__eo_1_0_100m
+    - prithvi_eo2__eo_2_0_300m
+    - olmoearth_v1_base
+    - resnet50__sentinel2_all_moco      # same MoCo / S2 pre-training as the ResNet18 -> depth contrast
+    - resnet18__sentinel2_all_moco
+  include_scratch: false
+  include: []
+  exclude: []
+
+# (2) parallel pipeline stage: conditions run in separate processes (largest first).
+#     DGX Spark (20 cores): 4 x 4 threads leaves room for a concurrent 1-2 worker MADOS run.
+pipeline_workers: 4
+threads_per_worker: 4
+
+pipeline:
+  # (4) primary upsampling variant only; add nearest / bilinear back later (they reuse the
+  #     primary variant's sampled pixels and its resource / weight analyses).
+  upsample_methods: [pixelshuffle]
+  # (5) weight analysis depends on the weights only: run once per model and family, copy to the
+  #     other conditions (seeded from conditions that already finished it).
+  share_across_conditions: [weight_matrix_analysis]
+  steps:
+    # global / synthesis steps have not completed anywhere yet, so lighter settings are safe
+    cross_perspective_synthesis:
+      config_overrides:
+        synthesis: {mantel_permutations: 2000}
+
+# geo_id has not completed either: drop the two slowest global estimators (DANCo, ESS; add back later)
+geo_id:
+  global_estimators: [MLE, TwoNN, MOM, TLE, FisherS, CorrInt]
+  n_perm: 199
+  mantel_max: 1000

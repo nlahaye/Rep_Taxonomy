@@ -32,6 +32,35 @@ from reptaxonomy.util.experiment_init_utils import (
 from reptaxonomy.pipelines.generate_embeddings import run_model_forward
 
 
+def _patch_calflops_conv_args() -> None:
+    """calflops' conv / conv-transpose FLOP formulas only accept tuple stride/padding/dilation;
+    convs that pass list arguments to F.conv2d (e.g. efficientnet-style same-padding convs in
+    the FTW UNet encoder, which set self.stride = [s, s]) raise
+    "unsupported operand type(s) for //: 'int' and 'list'". Convert lists to tuples before
+    counting; the wrapped convolution itself is called with the original arguments."""
+    import functools
+    from calflops import pytorch_ops as _ops
+
+    def _wrap(fn):
+        if getattr(fn, "_reptax_tuple_args", False):
+            return fn
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            t = lambda v: tuple(v) if isinstance(v, list) else v
+            return fn(*[t(a) for a in args], **{k: t(v) for k, v in kwargs.items()})
+
+        wrapped._reptax_tuple_args = True
+        return wrapped
+
+    for name in ("_conv_flops_compute", "_conv_trans_flops_compute"):
+        if hasattr(_ops, name):
+            setattr(_ops, name, _wrap(getattr(_ops, name)))
+
+
+_patch_calflops_conv_args()
+
+
 def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path

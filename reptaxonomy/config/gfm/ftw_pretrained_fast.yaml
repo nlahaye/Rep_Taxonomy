@@ -1,0 +1,32 @@
+# FTW, reduced setup: 7 models, one upsampling variant, 4 parallel workers, and the core
+# EarthShift shift-task conditions first. Deferred conditions keep their outputs and markers;
+# run them later by deleting their line under `exclude` (see `pipeline_overrides` for a lighter
+# setting that applies only to conditions that have not started).
+#
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/ftw_pretrained_fast.yaml \
+#       --stages pipeline cross_condition geo_id synthesis
+base: [ftw_pretrained.yaml, fast_common.yaml]
+
+datasets:
+  ftw:
+    conditions:
+      # tier 1 (now): 8 shift tasks x {train, id_test, ood_test} = 24 conditions
+      exclude:
+        - "ftw__ftw-all-window__ood_test__*"   # tier 2: per-country breakdown of the all-window OOD split (9)
+        - "ftw__country-*"                     # tier 2: per-country official test splits (10)
+        - "ftw__season-*"                      # tier 2: paired seasonal windows (10)
+      min_chips: 30                            # too few chips for stable ID / CKA estimates (rwanda 14, vietnam seasons 23)
+    # (3) lighter settings for conditions that have not started (ignored, with a warning, for
+    #     conditions with completed steps so each condition stays internally consistent)
+    pipeline_overrides:
+      - name: tier2_lite
+        match: ["ftw__country-*", "ftw__season-*", "ftw__ftw-all-window__ood_test__*"]
+        only_unstarted: true
+        pipeline:
+          n_runs: 2                            # 3 -> 2 pixel resamplings (UMAP / t-SNE fits)
+          steps:
+            run_projections: {config_overrides: {label_file_subset: 5}}   # half the sampled pixels
+            embedding_robustness:
+              config_overrides:
+                id_methods: [MLE, TwoNN, TLE, MOM, FisherS, CorrInt]      # drop DANCo / ESS / MiND / MADA
+                max_id_samples: 10000
