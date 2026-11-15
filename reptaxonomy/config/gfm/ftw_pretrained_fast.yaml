@@ -1,11 +1,11 @@
-# FTW, reduced setup: 7 models, one upsampling variant, 4 parallel workers, and the core
+# FTW, reduced setup: 7 models, one pixel variant + the patch level, 4 parallel workers, and the core
 # EarthShift shift-task conditions first. Deferred conditions keep their outputs and markers;
 # run them later by deleting their line under `exclude` (see `pipeline_overrides` for a lighter
 # setting that applies only to conditions that have not started).
 #
 #   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/ftw_pretrained_fast.yaml \
 #       --stages pipeline cross_condition geo_id synthesis
-base: [ftw_pretrained.yaml, fast_common.yaml]
+base: [ftw_pretrained.yaml, fast_common.yaml, patch_level.yaml]
 
 datasets:
   ftw:

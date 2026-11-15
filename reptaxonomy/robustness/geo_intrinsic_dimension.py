@@ -58,6 +58,8 @@ K_DEPENDENT = ("MLE", "DANCo", "TLE", "MOM", "MADA")   # others ignore k (report
 DEFAULTS: Dict[str, Any] = {
     "unit": "chip",                    # chip | token
     "max_tokens_per_chip": 16,
+    "token_cells": None,               # unit: token -> pool every model's grid to N x N cells per chip
+                                       # (aligned across patch sizes; None = each model's own tokens)
     "global_estimators": ["MLE", "TwoNN", "MOM", "TLE", "FisherS", "CorrInt", "DANCo", "ESS"],
     "ks_global": [10, 20, 100],
     "local_estimators": ["MLE", "TwoNN", "TLE"],
@@ -117,7 +119,16 @@ def condition_coordinates(work_dir: str, cond: str, coords_csv: Optional[str] = 
     return df.reset_index(drop=True)
 
 
-def _load_embedding(path: str, unit: str, max_tokens: int, rng: np.random.Generator) -> Optional[np.ndarray]:
+def _pool_cells(a: np.ndarray, n: int) -> np.ndarray:
+    """(C, h, w) -> (C, n, n) area average (same cell partition for every model)."""
+    import torch
+    import torch.nn.functional as F
+    g = torch.from_numpy(np.ascontiguousarray(a.reshape(a.shape[0], *a.shape[-2:]))).float().unsqueeze(0)
+    return F.adaptive_avg_pool2d(g, (int(n), int(n)))[0].numpy()
+
+
+def _load_embedding(path: str, unit: str, max_tokens: int, rng: np.random.Generator,
+                    token_cells: Optional[int] = None) -> Optional[np.ndarray]:
     try:
         a = np.load(path, mmap_mode="r")
     except Exception:
@@ -125,6 +136,8 @@ def _load_embedding(path: str, unit: str, max_tokens: int, rng: np.random.Genera
     a = np.asarray(a, dtype=np.float32)
     if a.ndim == 1:
         return a[None] if unit == "token" else a
+    if unit == "token" and token_cells and a.ndim >= 3:
+        a = _pool_cells(a, int(token_cells))
     tok = a.reshape(a.shape[0], -1).T  # (h*w, C)
     tok = tok[np.isfinite(tok).all(1)]
     if not len(tok):
@@ -137,12 +150,14 @@ def _load_embedding(path: str, unit: str, max_tokens: int, rng: np.random.Genera
 
 
 def load_points(embed_dir: str, cond: str, model: str, coords: pd.DataFrame, unit: str = "chip",
-                max_tokens: int = 16, split: str = "test", seed: int = 0) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+                max_tokens: int = 16, split: str = "test", seed: int = 0,
+                token_cells: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """-> X (n x C) or token cloud, owner (index of chip per row), chip table (rows with embeddings)."""
     rng = np.random.default_rng(seed)
     xs, own, keep = [], [], []
     for i, stem in enumerate(coords["stem"]):
-        e = _load_embedding(os.path.join(embed_dir, cond, model, split, f"embd_{stem}.npy"), unit, max_tokens, rng)
+        e = _load_embedding(os.path.join(embed_dir, cond, model, split, f"embd_{stem}.npy"), unit, max_tokens, rng,
+                            token_cells)
         if e is None:
             continue
         j = len(keep)
@@ -578,7 +593,8 @@ def run_geo_id(embed_dir: str, work_dir: str, out_dir: str, dataset: str, condit
         for m in models:
             Xs, owns, tabs, off = [], [], [], 0
             for c, df in cdict.items():
-                X, own, tab = load_points(embed_dir, c, m, df, p["unit"], p["max_tokens_per_chip"], split, p["seed"])
+                X, own, tab = load_points(embed_dir, c, m, df, p["unit"], p["max_tokens_per_chip"], split, p["seed"],
+                                           p.get("token_cells"))
                 if not len(tab):
                     continue
                 Xs.append(X); owns.append(own + off); tabs.append(tab.assign(scope=c)); off += len(tab)

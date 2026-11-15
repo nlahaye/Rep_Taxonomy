@@ -272,6 +272,8 @@ def run_step_block(
         parts = [step_name, model, state.method, step_cfg, None if model else cfg.get("model_names"), up]
         if str(cfg.get("pixelshuffle_factor", "auto")).lower() != "auto" and state.method == "pixelshuffle":
             parts.append(("pixelshuffle_factor", cfg.get("pixelshuffle_factor")))
+        if state.method == "patch":
+            parts.append(("patch", float(cfg.get("patch_cell_px", 32)), float(cfg.get("patch_min_purity", 0.75))))
         fp = RS.fingerprint(*parts)
         pol = state.policy
         shared = bool(model and state.share_root and step_name in state.shared_steps
@@ -392,8 +394,12 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
         variant_cfg = copy.deepcopy(common_cfg)
         variant_cfg["out_dir"] = out_dir
         variant_cfg["upsample_method"] = method
-        # Every variant samples the same pixels as the primary variant.
+        # Every pixel variant samples the same pixels as the primary variant; the patch-level
+        # variant samples cells of its own grid (shared by all models), cached in its out_dir.
         variant_cfg["index_cache_root"] = base_out_dir
+        if method == "patch":   # cell samples depend on the cell size and purity threshold
+            variant_cfg["index_cache_root"] = os.path.join(
+                out_dir, f"_cells_{float(cfg.get('patch_cell_px', 32)):g}px_p{float(cfg.get('patch_min_purity', 0.75)):g}")
         print(f"[PIPELINE] Upsampling variant={method} out_dir={out_dir}")
 
         per_ran = False

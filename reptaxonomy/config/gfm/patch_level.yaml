@@ -1,0 +1,24 @@
+# Patch-level analyses, as an extra base after the dataset / fast configs:
+#   base: [ftw_pretrained.yaml, fast_common.yaml, patch_level.yaml]
+#
+# Adds a "patch" variant next to the primary pixel variant. Each model's saved token grid is
+# area-averaged onto one cell grid per chip (cell size in pixels, identical for all models), so
+# every model contributes one aligned row per cell with no upsampling (no duplicated or
+# interpolated points, full channel count). Embeddings are reused; nothing is re-embedded.
+# Per-model projections / ID and all global steps (data kernel, reference similarity, geodesic,
+# Demsar) run on the cells; synthesis compares the patch rankings / matrices with the primary
+# variant and collects patch_class_retention.csv. Outputs: outputs/<cond>/upsample_patch/.
+# Finished pixel-variant work is untouched (separate markers and fingerprints).
+pipeline:
+  upsample_methods: [pixelshuffle, patch]   # primary first; add nearest / bilinear if wanted
+  patch_cell_px: 32         # cell size in pixels: coarsest model stride (ResNet, 32 px) keeps
+                            # every model at >= 1 token per cell (smaller cells repeat ResNet tokens)
+  patch_min_purity: 0.75    # cells labelled by majority class when >= 75 % of their pixels share
+                            # it; mixed cells are not sampled. 0 keeps every cell (majority label).
+
+# geo_id on aligned patch cells instead of mean-pooled chips (8 x 8 cells ~ 32 px for FTW 256 px
+# and MADOS 240 px chips). Remove this block to keep the chip-level geo_id.
+geo_id:
+  unit: token
+  token_cells: 8
+  max_tokens_per_chip: 16

@@ -144,6 +144,8 @@ def get_indices(
 
 
 UPSAMPLE_METHODS = ("pixelshuffle", "nearest", "bilinear")
+PATCH_METHOD = "patch"          # patch-level variant: tokens pooled onto a shared cell grid
+VARIANT_METHODS = UPSAMPLE_METHODS + (PATCH_METHOD,)
 
 
 def as_token_grid(embed: Any) -> np.ndarray:
@@ -203,6 +205,8 @@ def rescale_embed(
                      (align_corners=False, C' = C).
     """
     method = str(method).lower()
+    if method == PATCH_METHOD:
+        raise ValueError("upsample_method 'patch' pools tokens to cells; use pool_tokens_to_cells")
     if method not in UPSAMPLE_METHODS:
         raise ValueError(f"Unsupported upsample_method '{method}'; choose from {UPSAMPLE_METHODS}")
     tensor = torch.from_numpy(embed)
@@ -304,6 +308,76 @@ def sample_tokens_at_pixels(
     else:
         raise ValueError(f"sample_tokens_at_pixels does not support method '{method}'")
     return out
+
+
+# ----------------------------------------------------------------------------- patch level
+def patch_cell_grid(image_hw: Tuple[int, int], cell_px: float) -> Tuple[int, int]:
+    """Cells per chip side for a cell size in pixels (same for every model of a dataset)."""
+    H, W = int(image_hw[-2]), int(image_hw[-1])
+    c = float(cell_px)
+    if c <= 0:
+        raise ValueError(f"patch_cell_px must be > 0, got {cell_px}")
+    return max(1, int(round(H / c))), max(1, int(round(W / c)))
+
+
+def pool_tokens_to_cells(grid: np.ndarray, cells_hw: Tuple[int, int]) -> np.ndarray:
+    """(C, h, w) token grid -> (nh * nw, C): area average of the tokens covering each cell.
+
+    Cells partition the chip extent the same way for every model (adaptive average pooling),
+    so models with different patch sizes / strides yield one aligned row per cell. A model
+    whose grid is coarser than the cell grid repeats tokens (callers warn about this)."""
+    g = torch.from_numpy(np.ascontiguousarray(as_token_grid(grid))).float().unsqueeze(0)
+    pooled = F.adaptive_avg_pool2d(g, tuple(int(v) for v in cells_hw))[0]
+    return pooled.reshape(pooled.shape[0], -1).T.contiguous().numpy()
+
+
+def cell_labels(target: Any, cells_hw: Tuple[int, int], classes: List[int], ignore_index: int,
+                min_purity: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Majority label and purity per cell (same bins as pool_tokens_to_cells).
+
+    Returns (label, majority, purity, class_pixels):
+      majority : most frequent valid class per cell (ignore_index if the cell has no valid pixel)
+      purity   : fraction of the cell's pixels in the majority class (ignored pixels count against it)
+      label    : majority where purity >= min_purity, else ignore_index (cell not sampled)
+      class_pixels : valid-pixel count per class (len(classes))
+    """
+    t = target.detach().cpu().numpy() if torch.is_tensor(target) else np.asarray(target)
+    t = np.squeeze(t)
+    if t.ndim != 2:
+        raise ValueError(f"cell_labels expects a 2-D target, got shape {np.shape(target)}")
+    tt = torch.from_numpy(t.astype(np.int64))
+    onehot = torch.stack([(tt == c).float() for c in classes])               # K, H, W
+    frac = F.adaptive_avg_pool2d(onehot.unsqueeze(0), tuple(int(v) for v in cells_hw))[0]
+    frac = frac.reshape(len(classes), -1).numpy()                            # K, cells
+    cls = np.asarray(classes, dtype=np.int64)
+    purity = frac.max(0)
+    majority = np.where(purity > 0, cls[frac.argmax(0)], ignore_index)
+    label = np.where((purity > 0) & (purity >= float(min_purity)), majority, ignore_index)
+    class_pixels = onehot.reshape(len(classes), -1).sum(1).numpy().astype(np.int64)
+    return label.astype(np.int64), majority.astype(np.int64), purity.astype(np.float32), class_pixels
+
+
+def patch_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {"cell_px": float(cfg.get("patch_cell_px", 32)),
+            "min_purity": float(cfg.get("patch_min_purity", 0.75))}
+
+
+def write_patch_class_retention(cfg: Dict[str, Any], classes: List[int], pixels: np.ndarray,
+                                cells_majority: np.ndarray, cells_kept: np.ndarray,
+                                sampled: np.ndarray, settings: Dict[str, Any]) -> str:
+    """Per-class share of cells that survive the purity filter (identical for every model)."""
+    tot_px = max(int(pixels.sum()), 1)
+    df = pd.DataFrame({
+        "dataset": get_dataset_name(cfg), "class": classes,
+        "pixels": pixels, "pixel_frac": pixels / tot_px,
+        "cells_majority": cells_majority, "cells_kept": cells_kept,
+        "retention": np.where(cells_majority > 0, cells_kept / np.maximum(cells_majority, 1), np.nan),
+        "sampled_cells_run0": sampled,
+        "cell_px": settings["cell_px"], "min_purity": settings["min_purity"],
+    })
+    path = os.path.join(dataset_out_root(cfg), "patch_class_retention.csv")
+    RS.to_csv(df, path, index=False)
+    return path
 
 
 def _finalize_rescaled(tensor: torch.Tensor, target: Any, crop_info: Any) -> Tuple[np.ndarray, np.ndarray]:
@@ -431,7 +505,7 @@ def fit_or_load_projection(
             return reducer.transform(embed)
 
         logger.info("Computing PCs and projecting data %s", embed.shape)
-        reducer = PCA(n_components=min(int(cfg.get("pca_max_components", 64)), embed.shape[1]))
+        reducer = PCA(n_components=min(int(cfg.get("pca_max_components", 64)), embed.shape[0], embed.shape[1]))
         proj = reducer.fit_transform(embed)
 
     elif projection == "tsne":
@@ -567,6 +641,20 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
     ps_channels: Optional[int] = None
     ps_mismatch = 0
 
+    upsample_method = str(cfg.get("upsample_method", "pixelshuffle")).lower()
+    if upsample_method not in VARIANT_METHODS:
+        raise ValueError(f"Unsupported upsample_method '{upsample_method}'; choose from {VARIANT_METHODS}")
+    patch = upsample_method == PATCH_METHOD
+    if patch:
+        pset = patch_settings(cfg)
+        ignore_class = int(cfg["dataset"]["ignore_index"])
+        classes = [c for c in range(int(cfg["dataset"]["num_classes"]) + 1) if c != ignore_class]
+        ret_px = np.zeros(len(classes), np.int64)
+        ret_major = np.zeros(len(classes), np.int64)
+        ret_kept = np.zeros(len(classes), np.int64)
+        ret_sampled = np.zeros(len(classes), np.int64)
+        coarse_warned = False
+
     for run_idx in range(n_runs):
         embed_batches: List[np.ndarray] = []
         target_batches: List[np.ndarray] = []
@@ -618,10 +706,34 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             if img_size is None:
                 raise ValueError(f"Could not infer image size for {image_fname}")
 
-            upsample_method = str(cfg.get("upsample_method", "pixelshuffle")).lower()
             shape_info = infer_hw_from_crop(crop_info) if crop_info is not None else img_size
 
-            if upsample_method == "pixelshuffle":
+            if patch:
+                # Patch level: every model's tokens pooled onto the same cell grid over the chip
+                # (no upsampling); labels = majority class of cells with purity >= min_purity.
+                grid = as_token_grid(embed)
+                cells_hw = patch_cell_grid(img_size, pset["cell_px"])
+                if not coarse_warned and (grid.shape[-2] < cells_hw[0] or grid.shape[-1] < cells_hw[1]):
+                    logger.warning("[%s] token grid %s is coarser than the %s cell grid (cell_px=%s): tokens "
+                                   "are repeated; increase patch_cell_px", model_name, tuple(grid.shape[-2:]),
+                                   cells_hw, pset["cell_px"])
+                    coarse_warned = True
+                target_np, major, _pur, cpx = cell_labels(target, cells_hw, classes, ignore_class,
+                                                          pset["min_purity"])
+                if run_idx == 0:
+                    ret_px += cpx
+                    for i, c in enumerate(classes):
+                        ret_major[i] += int((major == c).sum())
+                        ret_kept[i] += int((target_np == c).sum())
+                indices = get_indices(cfg, run_idx, image_fname, target_np, cells_hw)
+                if indices.size == 0:
+                    continue
+                embed_sel = pool_tokens_to_cells(grid, cells_hw)[indices, :]
+                if run_idx == 0:
+                    sel_lab = target_np[indices]
+                    for i, c in enumerate(classes):
+                        ret_sampled[i] += int((sel_lab == c).sum())
+            elif upsample_method == "pixelshuffle":
                 grid = as_token_grid(embed)
                 if ps_factor is None:
                     ps_channels = int(grid.shape[0])
@@ -656,6 +768,17 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
                         model_name, run_idx, ps_mismatch, ps_factor)
             ps_mismatch = 0
         if not embed_batches:
+            if patch:   # never leave a previous setting's subset behind under a new fingerprint
+                for f in (embed_subset_path(cfg, run_idx, model_name=model_name),
+                          target_subset_path(cfg, run_idx, model_name=model_name),
+                          run_manifest_path(cfg, run_idx, model_name=model_name)):
+                    if os.path.exists(f):
+                        os.remove(f)
+                if run_idx == 0:   # still report which classes the threshold removed
+                    write_patch_class_retention(cfg, classes, ret_px, ret_major, ret_kept, ret_sampled, pset)
+                raise ValueError(f"[{model_name}] run_{run_idx}: no patch cells pass patch_min_purity="
+                                 f"{pset['min_purity']} (cell_px={pset['cell_px']}); lower the threshold "
+                                 "or the cell size")
             logger.warning("No embeddings selected for run_%s", run_idx)
             continue
 
@@ -691,7 +814,14 @@ def run_knn_gen(cfg: Dict[str, Any]) -> None:
             for row in sil_rows
         }
         manifest["projection_stats"] = by_projection
+        manifest["upsample_method"] = upsample_method
+        if patch:
+            manifest["patch"] = dict(pset)
         save_json(manifest, run_manifest_path(cfg, run_idx, model_name=model_name))
+
+    if patch:
+        path = write_patch_class_retention(cfg, classes, ret_px, ret_major, ret_kept, ret_sampled, pset)
+        logger.info("[%s] patch level: class retention -> %s", model_name, path)
 
     if all_sil_rows:
         pd.DataFrame(all_sil_rows).to_csv(

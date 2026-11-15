@@ -13,7 +13,7 @@ journal-level analyses:
   synthesis    : 5-axis ranking table, cross-axis Kendall tau, parallel-coordinate
                  rank profiles, Pareto fronts (silhouette / GFLOPs vs energy)
   sensitivity  : native lens (primary) vs 2-D projections (rank tau, Mantel),
-                 upsampling variants (pixelshuffle / nearest / bilinear) vs primary
+                 upsampling variants (pixelshuffle / nearest / bilinear / patch) vs primary
   references   : linear CKA and k-NN overlap matrices, Mantel vs data-kernel matrices
   invariance   : aggregation of invariance_checks.csv
 
@@ -587,6 +587,17 @@ def run_variant_block(syn: Dict[str, Any], datasets: Sequence[str], models: Sequ
         res["upsampling"] = df
     if mrows:
         pd.DataFrame(mrows).to_csv(os.path.join(out, "upsampling_sensitivity_similarity.csv"), index=False)
+    # patch-level variant: which classes survive the cell purity filter (one table per dataset)
+    ret = []
+    for name, vdir in variants.items():
+        for ds in datasets:
+            f = os.path.join(vdir, ds, "patch_class_retention.csv")
+            if os.path.exists(f):
+                ret.append(pd.read_csv(f).assign(variant=name, dataset=ds))
+    if ret:
+        rdf = pd.concat(ret, ignore_index=True)
+        rdf.to_csv(os.path.join(out, "patch_class_retention.csv"), index=False)
+        res["patch_class_retention"] = rdf
     return res
 
 

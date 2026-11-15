@@ -126,7 +126,7 @@ def fit_lens(X: np.ndarray, lens: str, cfg: Dict[str, Any]) -> np.ndarray:
         return normalize_native(X, cfg.get("native_normalization", "l2")).astype(np.float64)
     if lens == "pca":
         # Full SVD so the check isolates the transform rather than randomized-solver noise.
-        return PCA(n_components=min(int(cfg.get("pca_max_components", 64)), X.shape[1]),
+        return PCA(n_components=min(int(cfg.get("pca_max_components", 64)), X.shape[0], X.shape[1]),
                    svd_solver="full").fit_transform(X)[:, :2]
     if lens == "umap":
         import umap

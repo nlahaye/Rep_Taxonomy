@@ -1,8 +1,15 @@
-# MADOS, reduced setup (same 7 models / single variant as FTW). 3 conditions -> 3 workers.
+# MADOS, reduced setup (same 7 models / pixel + patch variants as FTW). 3 conditions -> 3 workers.
 # Run alongside the FTW run: 3 workers x 1 thread next to FTW's 4 x 4.
 #
 #   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/mados_pretrained_fast.yaml \
 #       --stages pipeline cross_condition geo_id synthesis
-base: [mados_pretrained.yaml, fast_common.yaml]
+base: [mados_pretrained.yaml, fast_common.yaml, patch_level.yaml]
 pipeline_workers: 3
 threads_per_worker: 1
+
+# patch level: MADOS chips are 240 px and ResNets see 224 px -> 7 x 7 tokens, so use 7 x 7 cells
+# (34 px) instead of the 32 px default (8 x 8 would repeat ResNet tokens).
+pipeline:
+  patch_cell_px: 34
+geo_id:
+  token_cells: 7
