@@ -12,40 +12,42 @@ _logger = logging.getLogger(__name__)
 
 
 def _optional_import(module: str, name: str):
-    """gfmtools releases differ in which datasets/models they ship (e.g. the
-    current release has no hlsburnscars_prealigned / precomputed_embeddings);
-    a missing optional class must not break every rep_taxonomy entry point."""
+    """Classes whose gfmtools module needs optional extras (rasterio, geopandas,
+    segmentation_models_pytorch, ...): a missing extra must not break every
+    rep_taxonomy entry point, so a placeholder raises only when it is used."""
     try:
         mod = __import__(module, fromlist=[name])
         return getattr(mod, name)
-    except Exception as exc:  # ImportError, missing optional deps
+    except ImportError as exc:
         _logger.debug("optional import %s.%s unavailable: %s", module, name, exc)
 
         class _Unavailable:  # placeholder keeps registries/type references valid
-            __name__ = name
-
             def __init__(self, *a, **k):
-                raise ImportError(f"{module}.{name} is not available in this gfmtools install: {exc}")
+                raise ImportError(f"{module}.{name} needs an optional dependency: {exc}")
 
         _Unavailable.__name__ = name
         return _Unavailable
 
 
+from reptaxonomy.gfm import require_gfmtools
+
+require_gfmtools()
+
+# Always present in gfmtools >= 0.2.0 (no optional dependencies).
+from gfmtools.models.croma import CROMAEncoder
+from gfmtools.models.dofa import DofaEncoder
+from gfmtools.models.precomputed_embeddings import PrecomputedEmbeddings
+from gfmtools.models.prithvi import PrithviEncoder, PrithviEO1_Weights, PrithviEO2_Weights
+from gfmtools.models.resnet import ResNetEncoder
+from gfmtools.models.swin import SwinEncoder
+
+# Need optional extras (xarray/geopandas, rasterio, segmentation_models_pytorch).
 EPALabels = _optional_import("gfmtools.data.datasets.epa", "EPALabels")
 HLSBurnScars = _optional_import("gfmtools.data.datasets.hlsburnscars", "HLSBurnScars")
 LandfireDataset = _optional_import("gfmtools.data.datasets.landfire", "LandfireDataset")
 HLSBurnScarsPreAlignedEmbeddings = _optional_import(
     "gfmtools.data.datasets.hlsburnscars_prealigned", "HLSBurnScarsPreAlignedEmbeddings")
-
-ResNetEncoder = _optional_import("gfmtools.models.resnet", "ResNetEncoder")
-SwinEncoder = _optional_import("gfmtools.models.swin", "SwinEncoder")
-DofaEncoder = _optional_import("gfmtools.models.dofa", "DofaEncoder")
-CROMAEncoder = _optional_import("gfmtools.models.croma", "CROMAEncoder")
-PrecomputedEmbeddings = _optional_import("gfmtools.models.precomputed_embeddings", "PrecomputedEmbeddings")
 unet = _optional_import("gfmtools.models.unet", "unet")
-PrithviEncoder = _optional_import("gfmtools.models.prithvi", "PrithviEncoder")
-PrithviEO1_Weights = _optional_import("gfmtools.models.prithvi", "PrithviEO1_Weights")
-PrithviEO2_Weights = _optional_import("gfmtools.models.prithvi", "PrithviEO2_Weights")
 
 from reptaxonomy.util.artifacts import ensure_dict
 

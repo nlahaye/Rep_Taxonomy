@@ -269,13 +269,14 @@ class EPARepSet(_RepSet):
     """
 
     def __init__(self, split: Optional[str] = None, region: Optional[str] = None,
-                 regions: Optional[Sequence[str]] = None, data_root: str = "/mnt/data/mtruong/",
+                 regions: Optional[Sequence[str]] = None, data_root: Optional[str] = None,
                  split_file: Optional[str] = None, instrument: str = "S2L2A",
                  included_timepoints: Any = (2, 3), timepoint: int = -1, img_size: int = 128,
                  gsd: int = 30, sample_limit: int = 5000, seed: int = 1917,
                  nlcd_level: int = 2, max_samples: Optional[int] = None, sample_seed: int = 0) -> None:
         super().__init__()
         from gfmtools.data.datasets.epa import EPALabels
+        # data_root=None -> gfmtools default ($GFMTOOLS_DATA_ROOT/epa or the legacy path)
         kw: Dict[str, Any] = dict(data_root=data_root, img_size=img_size, gsd=gsd,
                                   included_timepoints=tuple(included_timepoints)
                                   if isinstance(included_timepoints, (list, tuple)) else included_timepoints,
@@ -318,19 +319,19 @@ class EPARepSet(_RepSet):
     def _raw(self, base_index: int) -> Dict[str, Any]:
         return self.base[base_index]
 
-    def _select_time(self, d: torch.Tensor) -> torch.Tensor:
+    def _select_time(self, d: torch.Tensor, time_axis: Optional[int]) -> torch.Tensor:
+        """gfmtools >= 0.2.0 advertises the per-band time axis (None: single composite)."""
         d = torch.as_tensor(d)
-        if d.ndim == 3:
-            d = d[self.timepoint]
+        if time_axis is not None:
+            d = d.select(int(time_axis), self.timepoint)
         if d.ndim != 2:
-            raise ValueError(f"EPA band array has unexpected shape {tuple(d.shape)} "
-                             "(see GFMTOOLS_NOTES.md: EPALabels band indexing with several timepoints)")
+            raise ValueError(f"EPA band array has unexpected shape {tuple(d.shape)}")
         return d
 
     def _convert(self, s: Mapping[str, Any], i: int) -> Dict[str, Any]:
         inst = s[self.instrument]
         avail = [b for b in self.band_names if b in inst]
-        bands = {b: self._select_time(inst[b]["data"]) for b in avail}
+        bands = {b: self._select_time(inst[b]["data"], inst.get("time_axis")) for b in avail}
         tname = s["targets"][0]
         lab = torch.as_tensor(s[tname][s[tname]["bands"][0]]["data"]).long().clamp(0, 255)
         lab = self._lut_t[lab]
@@ -340,13 +341,16 @@ class EPARepSet(_RepSet):
         return self._pack(bands, lab, i, _time_string(inst, self.timepoint), inst.get("grid"))
 
 
-def list_epa_regions(data_root: str, split: Optional[str] = None, split_file: Optional[str] = None) -> List[str]:
+def list_epa_regions(data_root: Optional[str], split: Optional[str] = None, split_file: Optional[str] = None) -> List[str]:
     """US_L3NAME ecoregions available in the EPA dataset (or in one split of split_file)."""
     if split is not None and split_file:
         import yaml
         with open(split_file) as fh:
             return list(yaml.safe_load(fh)[split])
     import geopandas as gpd
+    if not data_root:
+        from gfmtools.utils.paths import default_data_root
+        data_root = default_data_root("epa", "/mnt/data/mtruong/")
     path = Path(data_root) / "epa_shapes" / "all_epa3_subsets.geojson"
     if path.exists():
         return sorted(set(gpd.read_file(path)["US_L3NAME"]))

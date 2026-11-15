@@ -160,7 +160,7 @@ def build_conditions(dataset: str, data_cfg: Dict[str, Any], experiments: Sequen
         elif dataset == "epa" and t == "ecoregions":
             regions = exp.get("regions", "all")
             if regions == "all":
-                regions = list_epa_regions(common.get("data_root", "/mnt/data/mtruong/"))
+                regions = list_epa_regions(common.get("data_root"))
             elif isinstance(regions, str) and regions.startswith("split:"):
                 regions = list_epa_regions(common.get("data_root"), regions.split(":", 1)[1], common.get("split_file"))
             train_regions = set()

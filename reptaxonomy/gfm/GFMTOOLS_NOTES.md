@@ -1,45 +1,36 @@
-# gfmtools issues found while integrating (snapshot: gfmtools-main as supplied)
+# gfmtools requirements
 
-`reptaxonomy.gfm` does **not** depend on the gfmtools `*Encoder` wrapper classes or the
-engines/decoders. It calls the gfmtools model *builders* and weight enums directly and works
-around the issues below, so no gfmtools change is required to run the pipelines. The list is
-here so the fixes can be made upstream; each item notes how rep_taxonomy handles it.
+`reptaxonomy.gfm` requires **gfmtools >= 0.2.0**. `reptaxonomy.gfm.require_gfmtools()` checks
+`gfmtools.__features__` when the catalog or the experiment registry is first imported and fails
+with an explicit message on an older install (older releases produced silently wrong EPA inputs).
 
-## Model wrappers
+`reptaxonomy.gfm` still calls the gfmtools model *builders* and weight enums directly rather than
+the `*Encoder.tensorize` helpers, because those expect fixed instrument keys and full band sets
+that the FTW (4 bands) and MADOS (11 bands) rep sets do not provide.
 
-| Location | Issue | rep_taxonomy handling |
+## Fixed in gfmtools 0.2.0 (rep_taxonomy workaround removed)
+
+| gfmtools issue | Previous rep_taxonomy workaround | Now |
 |---|---|---|
-| `models/scalemae.py` `ScaleMAEEncoder`, `models/unet.py` `UNetEncoder` | `nn.Module` subclass without `super().__init__()` (fails on first attribute assignment) | builders used directly |
-| `models/unet.py` `UNetEncoder` | `meta.bands` accessed as an attribute (meta is a dict) | uses `weights.meta["bands"]` |
-| `EncoderDecoderPipeline`, engines, decoders | no `super().__init__()`; engines are stubs; `SegFCN` is not an `nn.Module` | own heads/training in `gfm/finetune.py` |
-| `models/resnet.py` `ResNetEncoder` | string weights skip the build; `next(filter(...))` arguments reversed for Landsat | timm builders + weight enums directly |
-| `models/swin.py` | `model_mapper` arity mismatch; Swin T/S/B Cityscapes weights have no `bands` meta | builders directly; Cityscapes treated as RGB |
-| `models/dofa.py` | builder asserts that only `fc_norm`/`head` are missing, but released checkpoints have **no final norm at all**, so `global_pool=False` (token output) fails the assert; duplicate `reshape_input` definitions; default checkpoint is a local string path | build with `global_pool=True`, then switch to token output with an identity-initialised LayerNorm |
-| `models/prithvi.py` | `reshape_input()` calls `initialize_weights()` (wipes pretrained weights when image/patch size changes); only 3 configs vs 6 enum members (600M meta says patch 16 - verify); `PrithviViT` reads `patch_embed.num_frames`, which `PatchEmbed` never sets (AttributeError with temporal encoding) | native 224 input only; `patch_embed.num_frames` set per call; `forward_preprocessed` |
-| `models/croma.py` | `reshape_input` references `self.img_size` (undefined) | builder with `image_size` argument |
+| DOFA checkpoints have no final norm; token output (`global_pool=False`) failed | build pooled, swap in an identity LayerNorm | `builder(w, global_pool=False, final_norm="identity")` (bit-identical output) |
+| Prithvi `PatchEmbed.num_frames` never set | set `patch_embed.num_frames` before every forward | removed (bit-identical output) |
+| Prithvi 600M meta patch size 16 (HF config: 14); `reshape_input` wiped weights | 600M marked experimental; native size only | meta fixed; `reshape_input` keeps weights |
+| Weight meta: wrong `model`, missing `instrument`/`bands` | `_infer_sensor_and_bands` guessed from weight names + `in_chans`; hard-coded CROMA/DOFA/Scale-MAE bands | `catalog._sensor_and_bands` reads `instrument`/`bands`/`sensor` from the meta (sensor and band lists identical for all 110 entries) |
+| Known-fragile weights (ResNet152 Satlas, ResNet50 ETM SR, Swin Cityscapes, Prithvi 600M) | hard-coded `_EXPERIMENTAL` set | only weights with `derived_bands` (NDVI SECO) stay experimental |
+| EPA: with several timepoints the band index hit the time axis | `_select_time` assumed a leading time axis | arrays are band-first by name and carry `time_axis`; `_select_time` uses it |
+| `hlsburnscars_prealigned`, `models/precomputed_embeddings` missing | `_optional_import` placeholders | imported directly; placeholders kept only for classes that need extras |
+| Hard-coded `/mnt/data/...` defaults | rep_taxonomy passed paths | `data_root=None` resolves via `GFMTOOLS_DATA_ROOT` (legacy path when unset) |
+| Eager `gfmtools.data.datasets` imports | (import cost / extra deps) | lazy |
 
-## Weight metadata
+Also fixed upstream, not used by rep_taxonomy: `ScaleMAEEncoder` / `UNetEncoder` constructors,
+`ResNetEncoder` / `SwinEncoder` string weights and `model_mapper`, CROMA `reshape_input`,
+`SegFCN` as an `nn.Module`, `EncoderDecoderPipeline` constructor.
 
-- `ResNet152` Satlas meta says model `resnet50`, no instrument.
-- `ResNet50 LANDSAT_ETM_SR_*` meta says `resnet18`.
-- `Swin_V2_B SENTINEL2_MI_MS` meta says instrument `S1GRD`.
-- Several weights have no `instrument` / `bands`; `catalog._infer_sensor_and_bands` infers them
-  from the weight name and `in_chans`.
-- FTW UNet weights take 8 channels (window A + window B). The single-window rep sets feed the
-  same window twice, so treat these as an in-domain reference, not a native bi-temporal run.
+## Still relevant
 
-## Datasets
-
-- `data/datasets/epa.py`: with several `included_timepoints`, `image_tensor[band_index]`
-  indexes the time axis, not the band axis. `EPARepSet` selects one timepoint (`timepoint:`)
-  before band indexing.
-- `EPALabels` no longer accepts `transform`, and the key is `included_timepoints` (the old
-  rep_taxonomy preset passed `included_time_points`/`transform` -> `TypeError`; fixed in
-  `experiment_init_utils.py`). Default `split_file` path is `/home/rdemilt/spark/benchmark/epa_splits.yml`.
-- `gfmtools.data.datasets.__init__` imports every dataset eagerly, so importing `ftw_shifts`
-  needs `xarray`, `tifffile`, `geojson`, `rasterio`, `geopandas` even for FTW-only runs.
-- `hlsburnscars_prealigned` and `models/precomputed_embeddings` are not in this release; the
-  rep_taxonomy registry now imports them optionally.
+- FTW UNet weights take 8 channels (window A + window B, meta `num_windows: 2`). The single-window
+  rep sets feed the same window twice, so treat them as an in-domain reference.
+- `EPALabels` takes `included_timepoints` (not `included_time_points`) and no `transform`.
 
 ## Environment notes (not gfmtools)
 
@@ -47,10 +38,12 @@ here so the fixes can be made upstream; each item notes how rep_taxonomy handles
   SciPy `csr_array`. Use a graspologic release that supports your Python, or put `tests/compat` on
   `PYTHONPATH` (its `sitecustomize.py` aliases `nx.Ordered*` and converts `sparray -> csr_matrix`).
 - OlmoEarth needs `olmoearth_pretrain_minimal` (pip `olmoearth-pretrain-minimal`).
+- calflops passes list arguments to some `Conv2d` variants (EfficientNet same-padding);
+  `resources/compute_resource_reqs._patch_calflops_conv_args` handles it.
+- source.coop returns HTTP 403 without a `User-Agent` header; `scripts/ftw_geo_subset.py` sets one.
 
 ## Geolocation (geo_id)
 
 - `FTWRepSet.meta_rows` carries chip-centre lat/lon (from the chip footprint bounds, reprojected to
   EPSG:4326); the prepare stage stores them per condition. EPA and MADOS rows carry coordinates only
   if their gfmtools loaders expose bounds/CRS; otherwise set `geo_id.datasets.<family>.coords_csv`.
-- source.coop returns HTTP 403 without a `User-Agent` header; `scripts/ftw_geo_subset.py` sets one.

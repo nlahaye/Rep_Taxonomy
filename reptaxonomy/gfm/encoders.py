@@ -14,9 +14,9 @@ interface the existing rep_taxonomy pipelines already rely on:
 The gfmtools ``*Encoder.tensorize`` helpers are intentionally bypassed: they
 assume instrument keys (``S2L2A``/``HLS``/``LANDSAT``) and full band sets that
 FTW (``Sentinel-2``, 4 bands) and MADOS (``Sentinel-2``, 11 bands) do not
-provide, and several have constructor bugs (see GFMTOOLS_NOTES.md). Instead the
-adapter calls the gfmtools *builders* + weight enums directly and assembles the
-input tensor by canonical band name (``reptaxonomy.gfm.bands``).
+provide. Instead the adapter calls the gfmtools *builders* + weight enums
+directly and assembles the input tensor by canonical band name
+(``reptaxonomy.gfm.bands``). Requires gfmtools >= 0.2.0 (see GFMTOOLS_NOTES.md).
 """
 
 from __future__ import annotations
@@ -193,16 +193,9 @@ class GFMEncoder(nn.Module):
             return m
 
         if fam == "dofa":
-            # The released DOFA checkpoints carry no final norm (neither ``norm`` nor
-            # ``fc_norm``); gfmtools' builder only tolerates a missing fc_norm, so build
-            # with global_pool=True and switch to token output with an identity-initialised
-            # LayerNorm (plain per-token standardisation, no learned affine).
-            m = getattr(mod, e["builder"])(w, global_pool=True)
-            m.global_pool = False
-            m.norm = nn.LayerNorm(m.embed_dim, eps=1e-6)
-            if hasattr(m, "fc_norm"):
-                del m.fc_norm
-            return m
+            # Token output; the released checkpoints have no final norm, so gfmtools
+            # (>= 0.2.0) uses an identity-affine LayerNorm (same output as before).
+            return getattr(mod, e["builder"])(w, global_pool=False, final_norm="identity")
 
         if fam == "croma":
             return getattr(mod, e["builder"])(w, modalities=["optical"], image_size=int(self.input_size))
@@ -430,9 +423,6 @@ class GFMEncoder(nn.Module):
             tc, lc = self._prithvi_coords(batch, x.shape[0], x.device)
             x5 = x.unsqueeze(2)  # (B, C, T=1, H, W)
             vit = m.encoder.encoder if hasattr(m.encoder, "encoder") else m.encoder
-            # gfmtools' PrithviViT reads patch_embed.num_frames (never set by
-            # PatchEmbed) when temporal encoding is on; single-frame input here.
-            vit.patch_embed.num_frames = x5.shape[2]
             if tc is not None:
                 tc = tc[:, : x5.shape[2]]
             feats = m.forward_preprocessed(x5, tc, lc)

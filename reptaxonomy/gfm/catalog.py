@@ -13,7 +13,7 @@ weights added to gfmtools show up automatically. Each entry is a plain dict
     sensor       canonical sensor table used for the encoder's input bands
     bands        encoder input band names (sensor-native naming)
     input_size   spatial size fed to the encoder (pixels)
-    experimental True when the gfmtools wrapper/weights are known to be fragile
+    experimental True for weights whose inputs the rep sets cannot provide (derived bands)
 
 Model names
 -----------
@@ -40,11 +40,6 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 S2_12 = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
-S2_13 = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B10", "B11", "B12"]
-S2_RGB = ["B4", "B3", "B2"]
-S2_SECO_ECO_12 = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
-S2_NDVI_9 = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B11", "NDVI"]  # verify against weight card
-S2_SATLAS_MS = ["B4", "B3", "B2", "B5", "B6", "B7", "B8", "B11", "B12"]
 HLS6 = ["B2", "B3", "B4", "B5", "B6", "B7"]
 OLMOEARTH_S2 = ["B2", "B3", "B4", "B8", "B5", "B6", "B7", "B8A", "B11", "B12", "B1", "B9"]
 
@@ -87,56 +82,39 @@ _OLMOEARTH_ARTIFACTS = [
     "OLMOEARTH_V1_1_BASE", "OLMOEARTH_V1_2_NANO", "OLMOEARTH_V1_2_BASE",
 ]
 
-# Known-fragile weights (wrapper/checkpoint mismatches noted while integrating).
-_EXPERIMENTAL = {
-    ("swin_t", "CITYSCAPES_SEMSEG"), ("swin_s", "CITYSCAPES_SEMSEG"), ("swin_b", "CITYSCAPES_SEMSEG"),
-    ("resnet152", "SENTINEL2_MI_MS_SATLAS"), ("resnet152", "SENTINEL2_MI_RGB_SATLAS"),
-    ("resnet152", "SENTINEL2_SI_MS_SATLAS"), ("resnet152", "SENTINEL2_SI_RGB_SATLAS"),
-    ("resnet50", "LANDSAT_ETM_SR_MOCO"), ("resnet50", "LANDSAT_ETM_SR_SIMCLR"),
-    ("resnet50", "SENTINEL2_ALL_NDVI_SECO_ECO"),
-    ("prithvi_eo2", "EO_2_0_600M"), ("prithvi_eo2", "EO_2_0_600M_TL"),
-}
+_LANDSAT_SENSORS = {"TM": "tm", "ETM+": "etm", "OLI-TIRS": "oli"}
 
 
-def _infer_sensor_and_bands(arch: str, wname: str, meta: Dict[str, Any]) -> tuple[str, List[str]]:
-    n = wname.upper()
-    bands = list(meta.get("bands") or [])
+def _sensor_and_bands(meta: Dict[str, Any]) -> tuple[str, Optional[List[str]]]:
+    """Canonical sensor table + input bands from the gfmtools weight meta
+    (schema guaranteed by gfmtools >= 0.2.0: model/in_chans/instrument/bands,
+    ``sensor`` for Landsat, ``wavelength_agnostic`` for DOFA)."""
     inst = str(meta.get("instrument") or "").upper()
-    if "SENTINEL1" in n or inst == "S1GRD" and "SENTINEL2" not in n:
-        return "sar", bands or ["VV", "VH"]
-    if "LANDSAT" in n:
-        if "_TM_" in n:
-            return "tm", bands or ["B1", "B2", "B3", "B4", "B5", "B6", "B7"]
-        if "_ETM_" in n:
-            return "etm", bands
-        return "oli", bands
-    if "NAIP" in n or "OAM" in n or inst in ("NAIP", "OAM"):
-        return "rgbn", bands or ["R", "G", "B"]
-    if "FMOW" in n or "CITYSCAPES" in n:
-        return "rgbn", ["R", "G", "B"]
-    if arch.startswith("prithvi"):
-        return "hls", bands or HLS6
-    if "SENTINEL2" in n or inst.startswith("S2") or arch.startswith(("croma", "unet")):
-        if bands:
-            return "s2", bands
-        in_chans = meta.get("in_chans")
-        if "NDVI" in n:
-            return "s2", S2_NDVI_9
-        if "SECO_ECO" in n:
-            return "s2", S2_SECO_ECO_12
-        if "RGB" in n or in_chans == 3:
-            return "s2", S2_RGB
-        if "SATLAS" in n and in_chans == 9:
-            return "s2", S2_SATLAS_MS
-        if in_chans == 13:
-            return "s2", S2_13
-        if in_chans == 12:
-            return "s2", S2_12
-        return "s2", S2_13
-    return "s2", bands or S2_12
+    bands = list(meta["bands"]) if meta.get("bands") else None
+    if inst == "S1GRD":
+        return "sar", bands
+    if inst.startswith("S2"):
+        return "s2", bands
+    if inst == "HLS":
+        return "hls", bands
+    if inst.startswith("LANDSAT"):
+        return _LANDSAT_SENSORS[str(meta["sensor"]).upper()], bands
+    if inst in ("RGB", "NAIP", "OAM"):
+        return "rgbn", bands
+    if inst == "ANY" or meta.get("wavelength_agnostic"):
+        return "s2", None
+    raise ValueError(f"Unmapped gfmtools instrument {inst!r} ({meta.get('model')})")
+
+
+def _is_experimental(meta: Dict[str, Any]) -> bool:
+    # Derived (non-reflectance) inputs such as NDVI cannot be supplied by the rep sets.
+    return bool(meta.get("derived_bands"))
 
 
 def _build_catalog() -> Dict[str, Dict[str, Any]]:
+    from reptaxonomy.gfm import require_gfmtools
+
+    require_gfmtools()  # the meta schema below needs gfmtools >= 0.2.0
     cat: Dict[str, Dict[str, Any]] = {}
     for family, (module, archs) in _FAMILIES.items():
         try:
@@ -150,20 +128,15 @@ def _build_catalog() -> Dict[str, Dict[str, Any]]:
                 continue
             for w in enum_cls:
                 meta = dict(w.meta)
-                if family == "croma":
-                    sensor, bands = "s2", list(S2_12)
-                elif family == "dofa":
-                    sensor, bands = "s2", list(S2_12)  # wavelength-agnostic; uses dataset bands
-                elif family == "scalemae":
-                    sensor, bands = "rgbn", ["R", "G", "B"]
-                else:
-                    sensor, bands = _infer_sensor_and_bands(arch, w.name, meta)
+                sensor, bands = _sensor_and_bands(meta)
+                if bands is None:  # DOFA: wavelength-agnostic, fed the S2 L2A bands
+                    bands = list(S2_12)
                 key = f"{arch}__{w.name.lower()}"
                 entry = {
                     "key": key, "family": family, "arch": arch, "module": module,
                     "builder": builder, "enum": enum_name, "weights": w.name,
                     "sensor": sensor, "bands": list(bands), "input_size": size,
-                    "experimental": (arch, w.name) in _EXPERIMENTAL,
+                    "experimental": _is_experimental(meta),
                 }
                 if family == "prithvi":
                     entry["prithvi_cfg"] = {
