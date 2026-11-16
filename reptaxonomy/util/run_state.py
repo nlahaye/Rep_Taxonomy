@@ -243,6 +243,7 @@ def mark_done(unit_dir: PathLike, key: str = "unit", fp: Optional[str] = None, *
 
 
 def mark_failed(unit_dir: PathLike, key: str = "unit", error: str = "", **info: Any) -> Path:
+    marker_path(unit_dir, key, RUNNING_PREFIX).unlink(missing_ok=True)
     rec = {"key": key, "failed_at": _dt.datetime.now().isoformat(timespec="seconds"),
            "host": socket.gethostname(), "error": str(error)[-4000:], **info}
     return write_json(marker_path(unit_dir, key, FAILED_PREFIX), rec)
@@ -372,14 +373,55 @@ def scan(root: PathLike, prefixes: Sequence[str] = (DONE_PREFIX, FAILED_PREFIX, 
                 yield {"status": pre.strip("_.").lower(), "dir": str(p.parent), **rec}
 
 
+def pid_alive(rec: Dict[str, Any]) -> Optional[bool]:
+    """True/False for a running marker written on this host; None if written elsewhere."""
+    if rec.get("host") != socket.gethostname() or not rec.get("pid"):
+        return None
+    try:
+        os.kill(int(rec["pid"]), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+    return True
+
+
 def main() -> None:
+    import fnmatch
     ap = argparse.ArgumentParser(description="List completion / failure markers under a run root.")
     ap.add_argument("root")
     ap.add_argument("--failed", action="store_true", help="only failed and interrupted (running) units")
+    ap.add_argument("--key", nargs="*", default=None, metavar="GLOB",
+                    help="only markers whose key matches one of these globs, e.g. 'b.*' '*.unet__*'")
+    ap.add_argument("--clear", action="store_true",
+                    help="delete the matching FAILED / RUNNING markers (never DONE); use with --key and/or --stale")
+    ap.add_argument("--stale", action="store_true",
+                    help="only RUNNING markers whose process is no longer alive on this host")
+    ap.add_argument("--dry-run", action="store_true", help="with --clear: list what would be deleted")
     a = ap.parse_args()
-    pre = (FAILED_PREFIX, RUNNING_PREFIX) if a.failed else (DONE_PREFIX, FAILED_PREFIX, RUNNING_PREFIX)
+    if a.clear and not (a.key or a.stale):
+        ap.error("--clear needs --key and/or --stale")
+    pre = (FAILED_PREFIX, RUNNING_PREFIX) if (a.failed or a.clear) else (DONE_PREFIX, FAILED_PREFIX, RUNNING_PREFIX)
+    if a.stale:
+        pre = (RUNNING_PREFIX,)
     n = {}
     for r in scan(a.root, pre):
+        if a.key and not any(fnmatch.fnmatch(str(r.get("key", "")), g) for g in a.key):
+            continue
+        if r["status"] == "running":
+            alive = pid_alive(r)
+            if a.stale and alive is not False:
+                continue
+            if alive is False:
+                r["status"] = "stale"
+        if a.clear:
+            p = marker_path(r["dir"], r.get("key", "unit"), RUNNING_PREFIX if r["status"] in ("running", "stale")
+                            else FAILED_PREFIX)
+            if not a.dry_run:
+                p.unlink(missing_ok=True)
+            r["status"] = "would-rm" if a.dry_run else "removed"
         n[r["status"]] = n.get(r["status"], 0) + 1
         when = r.get("completed_at") or r.get("failed_at") or r.get("started_at") or ""
         err = (r.get("error") or "").strip().splitlines()[-1:] or [""]

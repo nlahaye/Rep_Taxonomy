@@ -104,7 +104,8 @@ def validate_pipeline_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("n_runs", 3)
     cfg.setdefault("seed", 42)
     cfg.setdefault("projections", ["native", "umap", "tsne", "pca"])
-    cfg.setdefault("upsample_methods", [cfg.get("upsample_method", "pixelshuffle")])
+    from reptaxonomy.util.general_utils import as_method_list
+    cfg["upsample_methods"] = as_method_list(cfg.get("upsample_methods"), cfg.get("upsample_method", "pixelshuffle"))
     cfg.setdefault("dataset_init", {})
     cfg.setdefault("model_init", {})
     cfg.setdefault("analysis", {})
@@ -243,8 +244,17 @@ def run_step_block(
     model_bundle: Any = None,
     skip: set | None = None,
     state: "StepState | None" = None,
+    errors: "Dict[str, str] | None" = None,
+    tolerate: "set | bool" = False,
 ) -> bool:
-    """Run a block of steps; returns True if any step actually ran."""
+    """Run a block of steps; returns True if any step actually ran.
+
+    A failing step writes its FAILED marker and re-raises, which stops the block. When ``errors``
+    is a dict and the step is tolerated (``tolerate`` is True or contains the step name), the
+    failure is recorded in ``errors`` instead and the remaining steps still run, so one broken
+    step (e.g. geodesic_compare) no longer silently prevents later steps, the other upsampling
+    variants and the synthesis from ever running.
+    """
     ran = False
     for item in steps:
         step_name, fn = item[0], item[1]
@@ -301,7 +311,14 @@ def run_step_block(
         except BaseException as exc:
             import traceback
             pol.failed(state.state_dir, key, traceback.format_exc() if isinstance(exc, Exception) else repr(exc))
-            raise
+            ok_to_continue = (errors is not None and isinstance(exc, Exception)
+                              and (tolerate is True or (tolerate and step_name in tolerate)))
+            if not ok_to_continue:
+                raise
+            errors[key] = f"{type(exc).__name__}: {exc}"
+            logger.error("[PIPELINE] step=%s model=%s variant=%s failed (%s); continuing with the next step",
+                         step_name, model or "global", state.method, errors[key])
+            continue
         pol.done(state.state_dir, key, fp)
         if shared:
             _publish_shared(step_name, cache, dest)
@@ -364,7 +381,8 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
 
     shared_model_init = ensure_dict(cfg.get("model_init", {}), "model_init")
     base_out_dir = str(cfg["out_dir"])
-    methods = [str(m).lower() for m in cfg["upsample_methods"]]
+    from reptaxonomy.util.general_utils import as_method_list
+    methods = as_method_list(cfg["upsample_methods"])
     primary = methods[0]
     variants: Dict[str, str] = {}
 
@@ -386,6 +404,7 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
     shared_steps = frozenset(cfg.get("share_across_conditions") or [])
     fail_fast = bool(cfg.get("fail_fast", False))
     failed: Dict[str, str] = {}    # model -> error; the other models (and global steps) still run
+    step_errors: Dict[str, str] | None = None if fail_fast else {}   # tolerated step failures
     any_ran = False
 
     for method in methods:
@@ -414,6 +433,7 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
                     skip=None if method == primary else UPSAMPLE_INDEPENDENT_STEPS,
                     state=StepState(policy, stage, state_dir, method, upstream,
                                     share_root=share_root, shared_steps=shared_steps),
+                    errors=step_errors, tolerate=UPSAMPLE_INDEPENDENT_STEPS,
                 )
             except Exception as exc:
                 if fail_fast:
@@ -435,6 +455,7 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
             global_steps, gcfg, gvar,
             skip=None if method == primary else PRIMARY_ONLY_GLOBAL_STEPS,
             state=StepState(policy, stage, state_dir, method, upstream, force=per_ran),
+            errors=step_errors, tolerate=True,
         )
         any_ran |= per_ran or glob_ran
 
@@ -451,10 +472,12 @@ def run_full_pipeline(cfg: Dict[str, Any]) -> None:
             fcfg = dict(cfg, model_names=ok)
             final_cfg["model_names"] = ok
         run_step_block(final_steps, fcfg, final_cfg,
-                       state=StepState(policy, stage, state_dir, "", upstream, force=any_ran))
-    if failed:
-        raise RuntimeError(f"{dataset_name}: per-model steps failed for {len(failed)} model(s) (rerun retries "
-                           f"them): " + "; ".join(f"{m}: {e}" for m, e in failed.items()))
+                       state=StepState(policy, stage, state_dir, "", upstream, force=any_ran),
+                       errors=step_errors, tolerate=True)
+    msgs = [f"{m}: {e}" for m, e in failed.items()] + [f"{k}: {e}" for k, e in (step_errors or {}).items()]
+    if msgs:
+        raise RuntimeError(f"{dataset_name}: {len(msgs)} step(s)/model(s) failed (rerun retries them): "
+                           + "; ".join(msgs))
 
 
 def main() -> None:

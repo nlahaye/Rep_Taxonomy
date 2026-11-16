@@ -1,0 +1,126 @@
+# Rep_Taxonomy + gfmtools environment (Python 3.12).
+#
+# Layout assumed: gfmtools checked out next to this repo
+#   ~/Rep_Taxonomy/pixi.toml   (this file)
+#   ~/gfmtools/                (installed editable)
+#
+# Python 3.12 is the version all requirements share: gfmtools needs >=3.12 (PEP 695 `type`
+# aliases; its pyproject must say requires-python='>=3.12'), graspologic 3.4.x needs <3.13
+# and numpy<2. numpy<2 in turn keeps umap-learn on 0.5.x, aeon on 1.3 and pyarrow on a
+# conda build (PyPI pyarrow>=20 needs numpy 2).
+#
+# Solved (Nov 2026): linux-aarch64 CUDA -> pytorch 2.13 / torchvision 0.28 (cuda130),
+# CPU -> pytorch 2.14.1; python 3.12.16, numpy 1.26.4, graspologic 3.4.4, umap-learn 0.5.12,
+# transformers 5.23, codecarbon 3.3.2. Delete pixi.lock if you copied one from another machine.
+#
+#   pixi install                  # CUDA 13 build on the DGX Spark (linux-aarch64) or x86 GPUs
+#   pixi run gpu-check            # expect the GB10, cc (12, 1), matmul ok
+#   pixi run smoke                # imports every analysis dependency
+#   pixi run -e cpu test          # CPU environment, e.g. for laptops / CI
+#   pixi run python -m reptaxonomy.pipelines.gfm_experiment -y ... (as before)
+
+[workspace]
+name = "rep-taxonomy"
+channels = ["conda-forge"]
+platforms = [
+  { name = "linux-64-cuda", platform = "linux-64", cuda = "13" },
+  { name = "linux-aarch64-cuda", platform = "linux-aarch64", cuda = "13" },
+  "linux-64",
+  "linux-aarch64",
+]
+
+[activation.env]
+# Rep_Taxonomy has no package metadata; import it from the checkout.
+PYTHONPATH = "$PIXI_PROJECT_ROOT"
+# Keep ~/.local site-packages (other Python installs) out of this environment.
+PYTHONNOUSERSITE = "1"
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+numpy = ">=1.26,<2"
+scipy = "*"
+pandas = "*"
+matplotlib-base = "*"
+seaborn = "*"
+scikit-learn = ">=1.7.1"
+scikit-image = ">=0.25.2"
+statsmodels = "*"
+joblib = "*"
+pyyaml = "*"
+tqdm = "*"
+# geospatial / IO (gfmtools)
+gdal = "*"
+rasterio = ">=1.4.3"
+geopandas = "*"
+shapely = "*"
+pyproj = "*"
+affine = "*"
+geojson = "*"
+geodatasets = "*"
+xarray = "*"
+zarr = "*"
+h5py = "*"
+netcdf4 = "*"
+pyarrow = "*"   # conda build matches numpy 1.x (PyPI pyarrow>=20 needs numpy 2)
+fsspec = "*"
+aiohttp = "*"
+requests = "*"
+# deep learning
+torchvision = "*"
+timm = "*"
+segmentation-models-pytorch = "*"
+einops = "*"
+hydra-core = ">=1.3.4"
+omegaconf = ">=2.3.1"
+huggingface_hub = "*"
+safetensors = "*"
+accelerate = "*"
+transformers = ">=4.40"   # geoclip needs CLIPModel; unpinned, the solver can fall back to 2.x
+# representation analyses
+graspologic = ">=3.4.4,<4"
+networkx = ">=3,<4"
+umap-learn = ">=0.5.7,<0.6"
+opentsne = "*"
+numba = "*"
+scikit-posthocs = "*"
+aeon = "*"
+powerlaw = "*"
+# compute / energy accounting
+codecarbon = ">=3.3"
+nvidia-ml-py = "*"
+psutil = "*"
+# tests
+pytest = "*"
+
+[pypi-dependencies]
+gfmtools = { path = "../gfmtools", editable = true }
+calflops = "*"
+weightwatcher = "*"
+scikit-dimension = "*"
+geoclip = "*"
+olmoearth-pretrain-minimal = "*"
+geotessera = "*"
+clint = "*"
+
+[feature.cuda]
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
+[feature.cuda.dependencies]
+cuda-version = "13.0.*"
+pytorch = { version = ">=2.5", build = "cuda*" }
+
+[feature.cpu]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.cpu.dependencies]
+pytorch = { version = ">=2.5", build = "cpu*" }
+
+[environments]
+default = { features = ["cuda"], solve-group = "cuda" }
+cpu = { features = ["cpu"], solve-group = "cpu" }
+
+[tasks]
+gpu-check = { cmd = ["python", "-c", "import torch; assert torch.cuda.is_available(), 'CUDA not available'; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), torch.cuda.get_arch_list()); x = torch.randn(2048, 2048, device='cuda'); torch.cuda.synchronize(); print('matmul ok', bool(torch.isfinite(x @ x).all()))"] }
+smoke = { cmd = ["python", "-c", "import numpy, torch, gfmtools, graspologic, umap, openTSNE, skdim, calflops, codecarbon, weightwatcher, scikit_posthocs, aeon, geoclip, olmoearth_pretrain_minimal, geotessera; import reptaxonomy.pipelines.gfm_experiment, reptaxonomy.intercompare.data_kernel_analysis as dk; print('numpy', numpy.__version__, 'torch', torch.__version__, 'graspologic sparse', dk._grasp_sparse_cls().__name__)"] }
+test = { cmd = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"] }

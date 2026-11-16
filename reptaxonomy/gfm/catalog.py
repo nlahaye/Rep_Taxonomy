@@ -87,7 +87,7 @@ _LANDSAT_SENSORS = {"TM": "tm", "ETM+": "etm", "OLI-TIRS": "oli"}
 
 def _sensor_and_bands(meta: Dict[str, Any]) -> tuple[str, Optional[List[str]]]:
     """Canonical sensor table + input bands from the gfmtools weight meta
-    (schema guaranteed by gfmtools >= 0.2.0: model/in_chans/instrument/bands,
+    (schema guaranteed by model/in_chans/instrument/bands,
     ``sensor`` for Landsat, ``wavelength_agnostic`` for DOFA)."""
     inst = str(meta.get("instrument") or "").upper()
     bands = list(meta["bands"]) if meta.get("bands") else None
@@ -114,7 +114,7 @@ def _is_experimental(meta: Dict[str, Any]) -> bool:
 def _build_catalog() -> Dict[str, Dict[str, Any]]:
     from reptaxonomy.gfm import require_gfmtools
 
-    require_gfmtools()  # the meta schema below needs gfmtools >= 0.2.0
+    require_gfmtools()  
     cat: Dict[str, Dict[str, Any]] = {}
     for family, (module, archs) in _FAMILIES.items():
         try:

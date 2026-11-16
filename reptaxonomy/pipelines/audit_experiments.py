@@ -423,7 +423,8 @@ class Auditor:
         missing = [m for m in models if m not in present]
         pipe = self.cfg.get("pipeline", {}) or {}
         steps_cfg = pipe.get("steps", {}) or {}
-        methods = [str(m).lower() for m in pipe.get("upsample_methods", [pipe.get("upsample_method", "pixelshuffle")])]
+        from reptaxonomy.util.general_utils import as_method_list
+        methods = as_method_list(pipe.get("upsample_methods"), pipe.get("upsample_method", "pixelshuffle"))
         primary = methods[0]
         enabled = lambda s: bool((steps_cfg.get(s, {}) or {}).get("enabled", True))
         if len(present) < 3:

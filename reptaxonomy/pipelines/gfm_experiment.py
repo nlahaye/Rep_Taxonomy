@@ -671,7 +671,8 @@ def family_synthesis(ctx: DatasetContext, cond_names: List[str], models: List[st
     upstream = {c: sorted((p.name, RS.file_stamp(p)) for p in Path(out_root, "_state", c).glob(RS.DONE_PREFIX + "*"))
                 for c in have}
     pipe = cfg.get("pipeline", {}) or {}
-    methods = [str(m).lower() for m in pipe.get("upsample_methods", ["pixelshuffle"])]
+    from reptaxonomy.util.general_utils import as_method_list
+    methods = as_method_list(pipe.get("upsample_methods"))
     base_syn = (pipe.get("steps", {}).get("cross_perspective_synthesis", {}) or {}).get("config_overrides", {}).get("synthesis", {})
     syn = dict(base_syn or {})
     syn.update({"datasets": have, "tag": tag, "out_subdir": "synthesis_pooled",
@@ -1297,6 +1298,10 @@ def main() -> None:
         for p in parts[:-1]:
             node = node.setdefault(p, {})
         node[parts[-1]] = yaml.safe_load(v)
+    _pipe = cfg.get("pipeline")
+    if isinstance(_pipe, dict) and "upsample_methods" in _pipe:
+        from reptaxonomy.util.general_utils import as_method_list
+        _pipe["upsample_methods"] = as_method_list(_pipe["upsample_methods"])
     if a.overwrite is not None:
         cfg["overwrite"] = True if not a.overwrite else list(a.overwrite)
     if a.no_check_config:

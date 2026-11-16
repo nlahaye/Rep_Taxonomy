@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import math
 import os
@@ -12,9 +13,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import scipy.sparse as sp
 from scipy.sparse import csr_array, csr_matrix, load_npz
 from graspologic.embed import AdjacencySpectralEmbed, ClassicalMDS, OmnibusEmbed
 from graspologic.simulations import rdpg
+
+
+@functools.lru_cache(maxsize=1)
+def _grasp_sparse_cls():
+    """Sparse class accepted by the installed graspologic. import_graph type-checks with
+    isinstance: older releases accept only scipy csr_matrix, newer releases only csr_array.
+    Returns None if neither is accepted (graphs are then passed dense)."""
+    from graspologic.utils import import_graph
+    probe = np.eye(2)
+    for cls in (csr_array, csr_matrix):
+        try:
+            import_graph(cls(probe), copy=True)
+            return cls
+        except TypeError:
+            continue
+    return None
+
+
+def grasp_graph(g, dtype=None):
+    """Convert a sparse or dense adjacency matrix to the type graspologic accepts."""
+    cls = _grasp_sparse_cls()
+    if cls is None:
+        a = g.toarray() if sp.issparse(g) else np.asarray(g)
+        return a.astype(dtype) if dtype is not None else a
+    return cls(g, dtype=dtype) if dtype is not None else cls(g)
 
 from reptaxonomy.util.general_utils import read_yaml
 from reptaxonomy.util.artifacts import (
@@ -109,12 +136,13 @@ def bootstrap_null_from_latents(
     if n_components is None:
         n_components = ase_latents.shape[1]
 
+    graph = grasp_graph(graph)
     n = ase_latents.shape[0]
     distances = np.zeros((n, number_of_bootstraps), dtype=np.float32)
     omni = OmnibusEmbed(n_components=n_components)
 
     for b in range(number_of_bootstraps):
-        graph_b = csr_array(rdpg(ase_latents, directed=False))
+        graph_b = grasp_graph(rdpg(ase_latents, directed=False))
         boot_latents = omni.fit_transform([graph, graph_b])
         distances[:, b] = np.linalg.norm(boot_latents[0] - boot_latents[1], axis=1)
 
@@ -141,7 +169,7 @@ def build_dist_mtx_cached(model_names: List[str], knn_graphs: Dict[str, csr_arra
     for i, name_i in enumerate(model_names):
         for j in range(i + 1, m):
             name_j = model_names[j]
-            omni_embds = omni.fit_transform([knn_graphs[name_i], knn_graphs[name_j]])
+            omni_embds = omni.fit_transform([grasp_graph(knn_graphs[name_i]), grasp_graph(knn_graphs[name_j])])
             num = np.linalg.norm(omni_embds[0] - omni_embds[1])
             den = np.linalg.norm(omni_embds[0] + omni_embds[1]) + 1e-8
             temp_dist = num / den
@@ -166,8 +194,8 @@ def pair_kernel_statistics(
     per-node p-values, signed residual, and relative Frobenius distance
     ||Z_a - Z_b||_F / ||Z_a + Z_b||_F. Used by the invariance checks.
     """
-    graph_a = csr_matrix(graph_a, dtype=np.float64)
-    graph_b = csr_matrix(graph_b, dtype=np.float64)
+    graph_a = grasp_graph(graph_a, dtype=np.float64)
+    graph_b = grasp_graph(graph_b, dtype=np.float64)
     omni = np.squeeze(OmnibusEmbed(n_components=2).fit_transform([graph_a, graph_b]))
     stat = np.linalg.norm(omni[0] - omni[1], axis=1)
     ase = AdjacencySpectralEmbed(n_components=n_components, svd_seed=seed).fit_transform(graph_a)
@@ -258,7 +286,7 @@ def run_taxonomic_analysis(
 ):
     os.makedirs(out_dir, exist_ok=True)
 
-    ordered_graphs = [knn_graphs[m] for m in model_names]
+    ordered_graphs = [grasp_graph(knn_graphs[m]) for m in model_names]
     omni_embds = OmnibusEmbed(n_components=2).fit_transform(ordered_graphs)
     omni_embds = np.squeeze(omni_embds)
 
@@ -272,7 +300,7 @@ def run_taxonomic_analysis(
         ase_latents = AdjacencySpectralEmbed(
             n_components=n_components,
             svd_seed=seed,
-        ).fit_transform(knn_graphs[model_name])
+        ).fit_transform(grasp_graph(knn_graphs[model_name]))
 
         null_cache[model_name] = bootstrap_null_from_latents(
             knn_graphs[model_name],

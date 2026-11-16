@@ -1,3 +1,4 @@
+import re
 
 import yaml
 
@@ -47,3 +48,21 @@ def resolve_model_names(cfg: dict[str, Any]) -> list[str]:
 
     return [str(x) for x in model_names]
 
+
+
+def as_method_list(value, default="pixelshuffle"):
+    """Normalise ``upsample_methods`` to a lower-case list of method names.
+
+    A scalar string (e.g. ``--set pipeline.upsample_methods=bilinear`` or ``"patch,nearest"``)
+    would otherwise be iterated character by character, producing variants 'b', 'p', 'n'.
+    """
+    if value is None or value == "" or value == []:
+        value = [default]
+    if isinstance(value, str):
+        value = [v for v in re.split(r"[,\s]+", value.strip().strip("[]")) if v]
+    out = []
+    for m in value:
+        m = str(m).strip().lower()
+        if m and m not in out:
+            out.append(m)
+    return out or [str(default).lower()]

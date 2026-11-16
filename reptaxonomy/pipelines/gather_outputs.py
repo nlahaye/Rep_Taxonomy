@@ -158,8 +158,8 @@ def resolve_spec(spec: RunSpec, cwd: Path) -> Dict[str, Any]:
 
 
 def methods_of(cfg: Dict[str, Any]) -> List[str]:
-    m = (cfg.get("pipeline", {}) or {}).get("upsample_methods") or ["pixelshuffle"]
-    return [str(x) for x in ([m] if isinstance(m, str) else m)]
+    from reptaxonomy.util.general_utils import as_method_list
+    return as_method_list((cfg.get("pipeline", {}) or {}).get("upsample_methods"))
 
 
 # ----------------------------------------------------------------------------- collection
