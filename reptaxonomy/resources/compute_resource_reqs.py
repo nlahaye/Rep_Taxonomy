@@ -270,6 +270,38 @@ def forward_encoder_only(model: Any, batch: Dict[str, Any], device: str) -> Any:
         return model.forward_instruments(batch, device=device)
 
 
+class _FlopsAdapter(torch.nn.Module):
+    """calflops forwards positional tensors only: it indexes ``args`` as a list and calls
+    ``.to(device)`` on every element, so a GFM dict batch passed as ``args`` fails with
+    ``KeyError: 0``. The adapter holds the (collated) batch and ignores calflops' dummy tensor;
+    the wrapped encoder is a sub-module, so parameters are still counted."""
+
+    def __init__(self, model: Any, batch: Dict[str, Any], device: str) -> None:
+        super().__init__()
+        self.model = model
+        self._batch = batch
+        self._device = device
+
+    def forward(self, _dummy: torch.Tensor) -> Any:
+        return forward_encoder_only(self.model, self._batch, self._device)
+
+
+def as_single_batch(sample: Any, collate_fn: Any = None) -> Any:
+    """Collate one dataset sample into a batch of size 1 (same collate as the test loader)."""
+    from torch.utils.data import default_collate
+    return (collate_fn or default_collate)([sample])
+
+
+def flops_for_batch(model: Any, batch: Dict[str, Any], device: str):
+    """``(flops, macs, params)`` strings from calflops for one dict batch."""
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = torch.device(device)
+    return calculate_flops(model=_FlopsAdapter(model, batch, device), args=[torch.zeros(1, device=dev)],
+                           output_as_string=True, output_precision=4, print_results=False)
+
+
 def _batch_size_of(batch: Dict[str, Any]) -> int:
     for inst in batch.get("instruments", []):
         inst = inst[0] if isinstance(inst, (list, tuple)) else inst
@@ -438,6 +470,10 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
 
     model = build_model_from_bundle(cfg, device)
     test_dataset = build_test_dataset_from_bundle(cfg)
+    try:   # collate exactly as the test loader does (handles None / string metadata)
+        collate_fn = getattr(build_test_loader(cfg), "collate_fn", None)
+    except Exception:
+        collate_fn = None
 
     signature_counter: Counter = Counter()
     signature_examples: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -470,13 +506,8 @@ def compute_resource_reqs(cfg: Dict[str, Any]):
     try:
         with torch.no_grad():
             for sig_key, count in signature_counter.items():
-                example_input = signature_examples[sig_key]
-                flops, macs, params = calculate_flops(
-                    model=model,
-                    args=example_input,
-                    output_as_string=True,
-                    output_precision=4,
-                )
+                example_input = as_single_batch(signature_examples[sig_key], collate_fn)
+                flops, macs, params = flops_for_batch(model, example_input, device)
                 flops_numeric = parse_numeric_flops(flops)
                 macs_numeric = parse_numeric_flops(macs)
 

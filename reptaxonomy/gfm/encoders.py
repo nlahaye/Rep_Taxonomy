@@ -370,7 +370,10 @@ class GFMEncoder(nn.Module):
         if missing:
             x[..., missing] = 0.0  # missing bands sit at the normaliser mean
         meta = batch.get("rt_meta", {}) or {}
-        times = list(meta.get("time") or [None] * bsz)[:bsz]
+        times = meta.get("time")
+        if times is None or isinstance(times, (str, bytes)) or not isinstance(times, Sequence):
+            times = [times] * bsz          # unbatched sample: one string, not characters
+        times = (list(times) + [None] * bsz)[:bsz]
         ts = []
         for t in times:
             d = _parse_time(t) or _parse_time(self.default_time)
