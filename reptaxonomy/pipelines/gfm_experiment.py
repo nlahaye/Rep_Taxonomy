@@ -176,7 +176,11 @@ class DatasetContext:
     def __init__(self, name: str, ds_cfg: Dict[str, Any]) -> None:
         self.name = name
         self.cfg = ds_cfg
-        self.conditions, comps, self.runs = build_conditions(name, ds_cfg.get("data", {}), ds_cfg.get("experiments", []))
+        # family: dataset type (ftw | epa | mados); a second key of the same family (e.g. epa_l8 with
+        # data.instrument: L8) gets its own band statistics, model coverage and condition names
+        self.family = str(ds_cfg.get("family", name))
+        self.conditions, comps, self.runs = build_conditions(self.family, ds_cfg.get("data", {}),
+                                                             ds_cfg.get("experiments", []), prefix=name)
         self.by_name: Dict[str, Condition] = {c.name: c for c in self.conditions}
         for r in self.runs:  # train/val conditions of FT runs that are not analysed themselves
             for c in (r.train, r.val):
@@ -888,12 +892,12 @@ def retention_conditions(ctxs: Dict[str, DatasetContext], ctx: DatasetContext, r
                 add(ctxs[fam], cname, "same_family" if fam == ctx.name else "cross_family")
         return out
     if rc.get("same_family", True):
-        tr_c, ood_c = (_ftw_task_countries(run.train) if ctx.name == "ftw" else (set(), set()))
+        tr_c, ood_c = (_ftw_task_countries(run.train) if ctx.family == "ftw" else (set(), set()))
         cands = []
         for c in ctx.analysed:
             if c.name in used or c.tags.get("in_train_split") or c.role in ("train", "val"):
                 continue
-            if ctx.name == "ftw":
+            if ctx.family == "ftw":
                 if tr_c is None:
                     continue  # run trains on every country -> nothing is held out
                 ctry = c.tags.get("country")
@@ -1210,6 +1214,10 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
                                  compute_weight_change=bool((cfg.get("finetune", {}) or {}).get("weight_change", True)),
                                  seed=int(cfg.get("seed", 0)))
 
+    # ---- cross-dataset comparisons (e.g. the same EPA chips seen by Sentinel-2 and Landsat)
+    if "cross_condition" in stages and cfg.get("cross_dataset_comparisons"):
+        cross_dataset_stage(ctxs, cfg, P)
+
     # ---- post-family stages (need every family's conditions / fine-tuning outputs)
     if mode == "finetune_compare":
         if "forgetting" in stages:
@@ -1217,6 +1225,43 @@ def run(cfg: Dict[str, Any], stages: Optional[Sequence[str]] = None, datasets: O
         if "ft_sequential" in stages:
             sequential_stage(ctxs, cfg, P)
     logger.info("done. outputs under %s", P["out_dir"])
+
+
+def cross_dataset_stage(ctxs: Dict[str, DatasetContext], cfg: Dict[str, Any], P: Dict[str, str]) -> None:
+    """``cross_dataset_comparisons: [{a: <cond>, b: <cond>, setup, kind, paired}]`` between
+    conditions of different dataset keys (models: those used by both). Outputs:
+    ``<out>/cross_condition/cross_dataset/``. Failures are logged, never fatal (unless fail_fast)."""
+    pol = RS.policy_from(cfg)
+    owner = {c.name: ctx for ctx in ctxs.values() for c in ctx.analysed}
+    comps, models = [], None
+    for c in cfg.get("cross_dataset_comparisons") or []:
+        a, b = c["a"], c["b"]
+        if a not in owner or b not in owner:
+            logger.warning("[cross_dataset] %s vs %s: condition not analysed in this run, skipped", a, b)
+            continue
+        comps.append({"setup": c.get("setup", f"cross:{a}~{b}"), "a": a, "b": b, "kind": c.get("kind", "paired"),
+                      "paired": bool(c.get("paired", c.get("kind", "paired") == "paired")), "tags": dict(c.get("tags", {}) or {})})
+        both = [m for m in owner[a].models if m in set(owner[b].models)]
+        models = both if models is None else [m for m in models if m in set(both)]
+    if not comps or not models:
+        return
+    cnames = sorted({x for c in comps for x in (c["a"], c["b"])})
+    cc = dict(cfg.get("cross_condition", {}) or {}); cc.pop("enabled", None)
+    unit = Path(P["out_dir"], "cross_condition", "cross_dataset")
+    fp = RS.fingerprint("cross_dataset", comps, models, cnames, cc,
+                        {f"{c}/{m}": embed_stamp(P, c, m) for c in cnames for m in models})
+    if not pol.should_run(unit, "cross_dataset", fp, "cross_condition"):
+        logger.info("[cross_dataset] complete, skipped")
+        return
+    pol.begin(unit, "cross_dataset", fp)
+    try:
+        run_cross_condition(P["embed_dir"], P["work_dir"], P["out_dir"], "cross_dataset", comps, models, cnames, **cc)
+        pol.done(unit, "cross_dataset", fp)
+    except Exception:
+        pol.failed(unit, "cross_dataset", traceback.format_exc())
+        logger.error("[cross_dataset] failed\n%s", traceback.format_exc())
+        if cfg.get("fail_fast"):
+            raise
 
 
 def geo_id_stage(name: str, conditions: Sequence[str], models: Sequence[str], gcfg: Dict[str, Any],

@@ -1,0 +1,27 @@
+# EPA / NLCD, reduced setup (same 7 models / pixel + patch variants as FTW and MADOS),
+# 5 parallel workers x 3 threads (15 cores). Conditions (epa_pretrained.yaml): 10 ecoregions,
+# within_group / east_west train-val-test, the leaf-off within_group test, and its Landsat view (epa_l8).
+#
+#   python -m reptaxonomy.pipelines.gfm_experiment -y reptaxonomy/config/gfm/epa_pretrained_fast.yaml \
+#       --stages pipeline cross_condition geo_id synthesis
+base: [epa_pretrained.yaml, fast_common.yaml, patch_level.yaml]
+pipeline_workers: 5
+threads_per_worker: 3
+
+# patch level: EPA S2L2A chips are 384 px (10 m; NLCD labels nearest-upsampled from 30 m) and the
+# ResNets see 224 px -> 7 x 7 tokens, so use 7 x 7 cells (55 px, ~18 label pixels) instead of the
+# 32 px default (12 x 12 would repeat ResNet tokens).
+pipeline:
+  patch_cell_px: 55
+geo_id:
+  token_cells: 7
+
+# Landsat chips are 128 px (30 m): 18 px cells give the same 7 x 7 grid (~550 m cells) as the
+# 55 px Sentinel-2 cells, so the sensor pair compares like-sized cells.
+datasets:
+  epa_l8:
+    pipeline_overrides:
+      - name: landsat_cells
+        match: ["epa_l8__*"]
+        only_unstarted: false
+        pipeline: {patch_cell_px: 18}

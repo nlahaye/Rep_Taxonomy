@@ -1,4 +1,5 @@
-# All three datasets in one run (separate per-dataset outputs; shared embedding cache).
+# All three datasets in one run (separate per-dataset outputs; shared embedding cache). EPA adds its
+# Landsat view (epa_l8) for the S2 vs Landsat paired comparison.
 base: [ftw_pretrained.yaml, epa_pretrained.yaml, mados_pretrained.yaml]
 root_dir: ./gfm_runs/all
 mode: pretrained

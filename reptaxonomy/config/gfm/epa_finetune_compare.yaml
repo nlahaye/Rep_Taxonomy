@@ -1,4 +1,5 @@
-# EPA: fine-tune on the train ecoregions, evaluate per ecoregion (ID = train ecoregions, OOD = others).
+# EPA: one fine-tuning run per region split scheme (epa-within_group, epa-east_west): train regions ->
+# val region, evaluated on the pooled test split and on each test ecoregion (all OOD regions).
 base: epa_pretrained.yaml
 mode: finetune_compare
 root_dir: ./gfm_runs/epa

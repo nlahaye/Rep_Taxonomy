@@ -1,4 +1,11 @@
-# EPA / NLCD: one condition per EPA Level-III ecoregion (US_L3NAME); pairwise ecoregion shift.
+# EPA / NLCD: ten EPA Level-III ecoregions (US_L3NAME), each with Sentinel-2, Landsat and NLCD stores.
+# Ecological groups, split schemes and distances: reptaxonomy/gfm/epa_regions.py.
+#   (1) ecoregions      one condition per ecoregion; the 45 pairs carry ecological distance labels
+#                       (0 same group / 1 same side / 2 East vs West) -> eco_distance_summary.csv
+#   (2) region_splits   within_group: new region of a familiar group; east_west: humid East -> dry and
+#                       mountain West. Pooled train / val / test conditions + one fine-tuning run each.
+#   (3) timepoint_pair  within_group test chips, leaf-off (timepoint 0) vs leaf-on (default) -> paired
+#   (4) epa_l8          the same within_group test chips seen by Landsat -> paired, cross-dataset
 base: base.yaml
 mode: pretrained
 root_dir: ./gfm_runs/epa
@@ -6,15 +13,33 @@ root_dir: ./gfm_runs/epa
 datasets:
   epa:
     num_classes: 16                      # NLCD level 2 (nlcd_level: 1 -> 8 classes)
-    band_stats: {source: compute, reference: epa__split-train, n_samples: 512}
-    data:
+    band_stats: {source: compute, reference: epa__within_group__train, n_samples: 512}
+    data: &epa_data
       data_root: /mnt/data/mtruong/
-      split_file: /mnt/data/mtruong/epa_splits.yaml   # train/val/test lists of ecoregions (fix path)
-      instrument: S2L2A                  # S2L2A (12 bands) | L8 (6 bands, 30 m)
-      included_timepoints: [2, 3]        # NB: gfmtools key is included_timepoints
-      timepoint: -1                      # which of the included timepoints is embedded
+      instrument: S2L2A                  # S2L2A (12 bands, 10 m) | L8 (6 bands, 30 m)
+      included_timepoints: [2, 3]        # gfmtools composites: 2 leaf-off, 3 leaf-on
+      timepoint: -1                      # index into included_timepoints (-1 = leaf-on)
       nlcd_level: 2
-      max_samples: 300
+      max_samples: 300                   # per single-ecoregion condition
+      max_samples_per_region: 100        # pooled split conditions: chips drawn per region (balanced)
     experiments:
-      - {type: ecoregions, regions: all}           # or a list of US_L3NAME, or "split:test"
-      - {type: splits, splits: [train, val, test]} # region-disjoint splits as conditions
+      - {type: ecoregions, regions: all}
+      - type: region_splits
+        schemes: [within_group, east_west]
+        finetune: true
+        finetune_max_samples_per_region: null   # fine-tuning sets: all chips (finetune.max_train_samples caps, balanced)
+      - {type: timepoint_pair, scheme: within_group, split: test, timepoint: 0, label: leafoff}
+
+  epa_l8:                                # Landsat view of the within_group test chips (same pair keys)
+    family: epa
+    num_classes: 16
+    band_stats: {source: compute, reference: epa_l8__within_group__test, n_samples: 512}
+    data:
+      <<: *epa_data
+      instrument: L8
+    experiments:
+      - {type: region_splits, schemes: [within_group], splits: [test], finetune: false}
+
+cross_dataset_comparisons:
+  - {setup: "sensor:within_group-test", a: epa__within_group__test, b: epa_l8__within_group__test,
+     kind: paired, paired: true, tags: {sensor_a: S2L2A, sensor_b: L8}}

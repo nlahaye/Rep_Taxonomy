@@ -259,11 +259,36 @@ class FTWRepSet(_RepSet):
 
 
 # ----------------------------------------------------------------------------- EPA
+class _EPARegions:
+    """Concatenation of single-region ``EPALabels`` (index -> (region dataset, local index))."""
+
+    def __init__(self, parts: Sequence[Any]) -> None:
+        self.parts = list(parts)
+        self.spans, off = [], 0
+        for p in self.parts:
+            self.spans.append((off, len(p)))
+            off += len(p)
+        self._n = off
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i: int) -> Dict[str, Any]:
+        for p, (off, n) in zip(self.parts, self.spans):
+            if off <= i < off + n:
+                return p[i - off]
+        raise IndexError(i)
+
+
 class EPARepSet(_RepSet):
     """EPA / NLCD representation set, optionally restricted to one EPA L3 ecoregion.
 
     ``region`` (one ``US_L3NAME``) -> ``EPALabels(split=None, regions=[region])``.
     ``split`` + ``split_file`` -> the region list of that split.
+    ``regions`` (a list) -> one ``EPALabels`` per region, concatenated. Each region is drawn exactly
+    as its single-region condition (same chip keys ``<region>__<index>``), at most
+    ``max_samples_per_region`` chips per region (an overall ``max_samples`` is split evenly), so
+    pooled split conditions share pair keys with the per-region conditions and with each other.
     ``instrument``: ``S2L2A`` (10 m, 384 px; labels nearest-upsampled) or ``L8``
     (30 m, 128 px, label-native).
     """
@@ -273,7 +298,8 @@ class EPARepSet(_RepSet):
                  split_file: Optional[str] = None, instrument: str = "S2L2A",
                  included_timepoints: Any = (2, 3), timepoint: int = -1, img_size: int = 128,
                  gsd: int = 30, sample_limit: int = 5000, seed: int = 1917,
-                 nlcd_level: int = 2, max_samples: Optional[int] = None, sample_seed: int = 0) -> None:
+                 nlcd_level: int = 2, max_samples: Optional[int] = None, sample_seed: int = 0,
+                 max_samples_per_region: Optional[int] = None) -> None:
         super().__init__()
         from gfmtools.data.datasets.epa import EPALabels
         # data_root=None -> gfmtools default ($GFMTOOLS_DATA_ROOT/epa or the legacy path)
@@ -283,11 +309,13 @@ class EPARepSet(_RepSet):
                                   seed=seed, sample_limit=sample_limit)
         if split_file:
             kw["split_file"] = split_file
-        if region is not None or regions:
-            kw.update(split=None, regions=[region] if region is not None else list(regions))
-        else:
+        multi = region is None and bool(regions)
+        if region is not None:
+            kw.update(split=None, regions=[region])
+        elif not multi:
             kw.update(split=split)
-        self.base = EPALabels(**kw)
+        self.base = _EPARegions([EPALabels(**dict(kw, split=None, regions=[r])) for r in regions]) if multi \
+            else EPALabels(**kw)
         self.region = region
         self.instrument = instrument
         self.sensor = "s2" if instrument.upper().startswith("S2") else "oli"
@@ -306,11 +334,23 @@ class EPARepSet(_RepSet):
         for c, k in self._lut.items():
             lut[c] = k
         self._lut_t = torch.as_tensor(lut)
-        n = len(self.base)
-        tag = slug(region) if region else slug(split or "all")
-        keys = [f"{tag}__{i:06d}" for i in range(n)]
-        self.indices = stable_subsample(keys, max_samples, sample_seed)
-        self.sample_keys = [keys[i] for i in self.indices]
+        if multi:
+            cap = max_samples_per_region
+            if max_samples is not None:
+                even = -(-int(max_samples) // len(regions))
+                cap = even if cap is None else min(int(cap), even)
+            self.indices, self.sample_keys = [], []
+            for r, (off, n_r) in zip(regions, self.base.spans):
+                keys = [f"{slug(r)}__{i:06d}" for i in range(n_r)]
+                sel = stable_subsample(keys, cap, sample_seed)
+                self.indices += [off + i for i in sel]
+                self.sample_keys += [keys[i] for i in sel]
+        else:
+            n = len(self.base)
+            tag = slug(region) if region else slug(split or "all")
+            keys = [f"{tag}__{i:06d}" for i in range(n)]
+            self.indices = stable_subsample(keys, max_samples, sample_seed)
+            self.sample_keys = [keys[i] for i in self.indices]
         self.pair_keys = list(self.sample_keys)
         self.band_names = (["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
                            if self.sensor == "s2" else ["B2", "B3", "B4", "B5", "B6", "B7"])

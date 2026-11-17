@@ -14,8 +14,18 @@ FTW (``dataset: ftw``)
   shift_by_country  OOD (or any) split of a multi-country task broken out by country.
   per_country       official split, one condition per country (country x country matrix).
   seasonal_paired   same AOIs, window A vs window B, per country -> *paired* chips.
-EPA (``dataset: epa``)
+EPA (``dataset: epa``; another dataset key with ``family: epa`` prefixes its conditions with that key)
   ecoregions        one condition per US_L3NAME ecoregion (``regions: all | [..] | split:<name>``).
+                    Pairwise comparisons carry ecological distance labels (``epa_regions``):
+                    eco_distance 0 same group / 1 same side / 2 East vs West, plus the Level I / II
+                    hierarchy distance when the ecoregion GeoJSON provides it.
+  region_splits     named region-disjoint schemes (``schemes: [within_group, east_west]`` or explicit
+                    ``{name: {train, val, test}}``); one pooled condition per scheme split
+                    (``<ds>__<scheme>__<split>``), balanced per region, and a fine-tuning run
+                    ``<ds>-<scheme>`` (train -> val, evaluated on test and on the per-region test
+                    conditions). ``finetune_max_samples_per_region`` sizes separate training sets.
+  timepoint_pair    the same chips of one scheme split at another composite (``timepoint``, e.g. 0 =
+                    leaf-off) -> paired comparison with the default (leaf-on) condition.
   splits            split_file splits (train / val / test region groups).
 MADOS (``dataset: mados``)
   splits            train / val / test.
@@ -27,6 +37,7 @@ import itertools
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from reptaxonomy.gfm import epa_regions as ER
 from reptaxonomy.gfm.datasets import list_epa_regions, slug
 
 EARTHSHIFT_TABLE1 = ("ftw-south_africa-window", "ftw-germany-year", "ftw-all-window",
@@ -56,6 +67,7 @@ class Comparison:
     b: str
     kind: str              # reference | shift | paired | pairwise
     paired: bool = False
+    tags: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -78,8 +90,27 @@ def _ftw_tasks(spec: Any) -> List[str]:
     return list(spec)
 
 
-def build_conditions(dataset: str, data_cfg: Dict[str, Any], experiments: Sequence[Dict[str, Any]]):
-    """Return (conditions, comparisons, finetune_runs)."""
+def _epa_scheme_condition(px: str, base: Dict[str, Any], scheme: str, split: str, regions: Sequence[str],
+                          cap: Any = "same", suffix: str = "", analyze: bool = True) -> Condition:
+    """Pooled condition of one scheme split, drawn per region (keys shared with per-region conditions)."""
+    kw = {k: v for k, v in base.items() if k not in ("split", "region", "split_file")}
+    kw["regions"] = list(regions)
+    if cap != "same":
+        kw["max_samples_per_region"] = cap
+    kw.setdefault("max_samples_per_region", None)
+    if kw["max_samples_per_region"] is not None:
+        kw["max_samples"] = None   # the per-region cap sizes pooled conditions
+    groups = sorted({g for g in (ER.eco_group(r) for r in regions) if g})
+    return Condition(f"{px}__{slug(scheme)}__{split}{suffix}", "epa", "EPARepSet", kw, f"region_split:{scheme}",
+                     role=split, analyze=analyze and not suffix,
+                     tags={"scheme": scheme, "regions": list(regions), "eco_groups": groups})
+
+
+def build_conditions(dataset: str, data_cfg: Dict[str, Any], experiments: Sequence[Dict[str, Any]],
+                     prefix: Optional[str] = None):
+    """Return (conditions, comparisons, finetune_runs). ``prefix`` (default: ``dataset``) names the
+    EPA conditions, so a second EPA family (e.g. Landsat) has its own condition names."""
+    px = prefix or dataset
     conds: Dict[str, Condition] = {}
     comps: List[Comparison] = []
     runs: List[FinetuneRun] = []
@@ -174,29 +205,85 @@ def build_conditions(dataset: str, data_cfg: Dict[str, Any], experiments: Sequen
             for r in regions:
                 kw = dict(base, region=r)
                 kw.pop("split", None)
+                kw.pop("max_samples_per_region", None)   # only used by pooled scheme conditions
                 role = "id_region" if r in train_regions else "region"
-                names.append(add(Condition(f"epa__{slug(r)}", "epa", "EPARepSet", kw, "ecoregions", role=role,
-                                           tags={"region": r, "in_train_split": r in train_regions})).name)
-            comps += [Comparison("ecoregions", a, b, "pairwise") for a, b in itertools.combinations(names, 2)]
+                names.append(add(Condition(f"{px}__{slug(r)}", "epa", "EPARepSet", kw, "ecoregions", role=role,
+                                           tags={"region": r, "in_train_split": r in train_regions,
+                                                 "eco_group": ER.eco_group(r)})).name)
+            hier = ER.region_hierarchy(common.get("data_root")) if exp.get("hierarchy", True) else {}
+            for a, b in itertools.combinations(names, 2):
+                ra, rb = conds[a].tags["region"], conds[b].tags["region"]
+                d = ER.eco_distance(ra, rb)
+                tags = {"region_a": ra, "region_b": rb, "group_a": ER.eco_group(ra), "group_b": ER.eco_group(rb),
+                        "eco_distance": d, "eco_distance_label": ER.DISTANCE_LABELS.get(d)}
+                hd = ER.hierarchy_distance(ra, rb, hier)
+                if hd is not None:
+                    tags["hier_distance"] = hd
+                comps.append(Comparison("ecoregions", a, b, "pairwise", tags=tags))
             if exp.get("finetune", True) and common.get("split_file"):
-                tr = Condition("epa__split-train", "epa", "EPARepSet", dict(base, split="train"), "epa_splits", role="train",
-                               analyze=False)
-                va = Condition("epa__split-val", "epa", "EPARepSet", dict(base, split="val"), "epa_splits", role="val",
-                               analyze=False)
-                runs.append(FinetuneRun(tag="epa-train", dataset="epa", train=tr, val=va, eval_conditions=names,
+                tr = Condition(f"{px}__split-train", "epa", "EPARepSet", dict(base, split="train"), "epa_splits",
+                               role="train", analyze=False)
+                va = Condition(f"{px}__split-val", "epa", "EPARepSet", dict(base, split="val"), "epa_splits",
+                               role="val", analyze=False)
+                runs.append(FinetuneRun(tag=f"{px}-train", dataset="epa", train=tr, val=va, eval_conditions=names,
                                         id_conditions=[n for n in names if conds[n].tags.get("in_train_split")],
                                         ood_conditions=[n for n in names if not conds[n].tags.get("in_train_split")]))
 
         elif dataset == "epa" and t == "splits":
             names = []
             for sp in exp.get("splits", ["train", "val", "test"]):
-                names.append(add(Condition(f"epa__split-{sp}", "epa", "EPARepSet", dict(base, split=sp),
+                names.append(add(Condition(f"{px}__split-{sp}", "epa", "EPARepSet", {k: v for k, v in dict(base, split=sp).items()
+                                                                            if k != "max_samples_per_region"},
                                            "epa_splits", role=sp)).name)
             comps += [Comparison("epa_splits", a, b, "pairwise") for a, b in itertools.combinations(names, 2)]
-            if "epa__split-train" in conds and "epa__split-test" in conds:
-                runs.append(FinetuneRun(tag="epa-train", dataset="epa", train=conds["epa__split-train"],
-                                        val=conds.get("epa__split-val"), eval_conditions=["epa__split-test"],
-                                        ood_conditions=["epa__split-test"]))
+            if f"{px}__split-train" in conds and f"{px}__split-test" in conds:
+                runs.append(FinetuneRun(tag=f"{px}-train", dataset="epa", train=conds[f"{px}__split-train"],
+                                        val=conds.get(f"{px}__split-val"), eval_conditions=[f"{px}__split-test"],
+                                        ood_conditions=[f"{px}__split-test"]))
+
+        elif dataset == "epa" and t == "region_splits":
+            schemes = exp.get("schemes", ["within_group", "east_west"])
+            items = list(schemes.items()) if isinstance(schemes, dict) else [(n, n) for n in schemes]
+            splits = list(exp.get("splits", ["train", "val", "test"]))
+            for sname, spec in items:
+                scheme = ER.resolve_scheme(spec, sname)
+                ER.check_scheme(sname, scheme)
+                made = {sp: add(_epa_scheme_condition(px, base, sname, sp, scheme[sp]))
+                        for sp in splits if scheme.get(sp)}
+                names = [c.name for c in made.values()]
+                for a, b in itertools.combinations(names, 2):
+                    kind = "shift" if conds[b].role == "test" or conds[a].role == "test" else "reference"
+                    comps.append(Comparison(f"region_split:{sname}", a, b, kind, tags={"scheme": sname}))
+                if not exp.get("finetune", True) or not scheme.get("train"):
+                    continue
+                ft_cap = exp.get("finetune_max_samples_per_region", "same")
+                tr, va = made.get("train"), made.get("val")
+                if ft_cap != "same":   # separate (not analysed) training / validation sets
+                    fb = dict(base, max_samples=None)
+                    tr = add(_epa_scheme_condition(px, fb, sname, "train", scheme["train"], ft_cap, "-ft"))
+                    va = add(_epa_scheme_condition(px, fb, sname, "val", scheme["val"], ft_cap, "-ft")) \
+                        if scheme.get("val") else None
+                if tr is None:
+                    tr = add(_epa_scheme_condition(px, base, sname, "train", scheme["train"], analyze=False))
+                test = [made["test"].name] if "test" in made else []
+                per_region = [f"{px}__{slug(r)}" for r in scheme.get("test", []) if f"{px}__{slug(r)}" in conds]
+                runs.append(FinetuneRun(tag=f"{px}-{slug(sname)}", dataset="epa", train=tr, val=va,
+                                        eval_conditions=test + per_region, ood_conditions=test + per_region))
+
+        elif dataset == "epa" and t == "timepoint_pair":
+            sname = exp.get("scheme", "within_group")
+            sp = exp.get("split", "test")
+            scheme = ER.resolve_scheme(exp.get("regions_from", sname), sname)
+            ref = add(_epa_scheme_condition(px, base, sname, sp, scheme[sp]))
+            tp = int(exp.get("timepoint", 0))
+            label = slug(exp.get("label") or f"t{tp}")
+            alt = _epa_scheme_condition(px, dict(base, timepoint=tp), sname, sp, scheme[sp])
+            alt.name, alt.setup, alt.role = f"{ref.name}__{label}", f"timepoint:{sname}-{sp}", "season"
+            alt.tags = dict(alt.tags, timepoint=tp, timepoint_label=label)
+            alt = add(alt)
+            ref.paired_with, alt.paired_with = alt.name, ref.name
+            comps.append(Comparison(alt.setup, ref.name, alt.name, "paired", paired=True,
+                                    tags={"scheme": sname, "split": sp, "timepoint_b": tp, "label_b": label}))
 
         elif dataset == "mados" and t == "splits":
             names = []

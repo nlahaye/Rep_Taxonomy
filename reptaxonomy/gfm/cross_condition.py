@@ -329,6 +329,51 @@ def _heatmaps(df: pd.DataFrame, out: Path, formats: Sequence[str]) -> None:
         plt.close(fig)
 
 
+_RESERVED = {"setup", "kind", "a", "b", "model", "metric", "value", "n_models", "spearman_rho"}
+DISTANCE_COLUMNS = ("eco_distance", "hier_distance")
+
+
+def _tag_cols(comp: Dict[str, Any]) -> Dict[str, Any]:
+    """Comparison tags (e.g. EPA ecological distance labels) as extra table columns."""
+    return {k: v for k, v in (comp.get("tags") or {}).items() if k not in _RESERVED and not isinstance(v, (list, dict))}
+
+
+def distance_summary(df: pd.DataFrame, stab: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Does representation shift grow with ecological distance?
+
+    For every distance column present (``eco_distance``: 0 same group / 1 same side / 2 East vs
+    West; ``hier_distance``: Level II / I), per model and metric: Spearman rho between the metric
+    and the distance over condition pairs, and the metric mean at each distance level. The
+    inter-model taxonomy stability (``model = __taxonomy__``) is summarised the same way."""
+    from scipy.stats import spearmanr
+    frames = []
+    if df is not None and not df.empty:
+        frames.append(df)
+    if stab is not None and not stab.empty:
+        frames.append(stab.assign(model="__taxonomy__", metric="taxonomy_spearman_rho",
+                                  value=stab["spearman_rho"]))
+    if not frames:
+        return pd.DataFrame()
+    data = pd.concat(frames, ignore_index=True)
+    rows = []
+    for dcol in DISTANCE_COLUMNS:
+        if dcol not in data.columns:
+            continue
+        sub = data[pd.to_numeric(data[dcol], errors="coerce").notna()]
+        for (m, met), g in sub.groupby(["model", "metric"]):
+            d = g[dcol].astype(float).values
+            v = pd.to_numeric(g["value"], errors="coerce").values
+            ok = np.isfinite(d) & np.isfinite(v)
+            row = {"distance": dcol, "model": m, "metric": met, "n_pairs": int(ok.sum())}
+            if ok.sum() >= 4 and len(set(d[ok])) > 1:
+                r = spearmanr(d[ok], v[ok])
+                row.update(spearman_rho=float(r.statistic), p_value=float(r.pvalue))
+            for lvl in sorted(set(d[ok])):
+                row[f"mean_at_{int(lvl)}"] = float(np.mean(v[ok][d[ok] == lvl]))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def run_cross_condition(embed_dir: str, work_dir: str, out_dir: str, dataset: str,
                         comparisons: Sequence[Dict[str, Any]], models: Sequence[str],
                         conditions: Sequence[str], n_perm: int = 200, pca_dim: int = 64,
@@ -354,7 +399,7 @@ def run_cross_condition(embed_dir: str, work_dir: str, out_dir: str, dataset: st
                 continue
             for k, v in res.items():
                 rows.append({"setup": comp["setup"], "kind": comp["kind"], "a": comp["a"], "b": comp["b"],
-                             "model": m, "metric": k, "value": v})
+                             "model": m, "metric": k, "value": v, **_tag_cols(comp)})
     df = pd.DataFrame(rows)
     df.to_csv(out / "pairwise_metrics.csv", index=False)
 
@@ -384,8 +429,13 @@ def run_cross_condition(embed_dir: str, work_dir: str, out_dir: str, dataset: st
         ok = np.isfinite(a) & np.isfinite(b)
         if ok.sum() >= 3:
             stab.append({"setup": comp["setup"], "kind": comp["kind"], "a": comp["a"], "b": comp["b"],
-                         "n_models": len(common), "spearman_rho": float(spearmanr(a[ok], b[ok]).statistic)})
-    pd.DataFrame(stab).to_csv(out / "taxonomy_stability.csv", index=False)
+                         "n_models": len(common), "spearman_rho": float(spearmanr(a[ok], b[ok]).statistic),
+                         **_tag_cols(comp)})
+    stab_df = pd.DataFrame(stab)
+    stab_df.to_csv(out / "taxonomy_stability.csv", index=False)
+    eco = distance_summary(df, stab_df)
+    if not eco.empty:
+        eco.to_csv(out / "eco_distance_summary.csv", index=False)
     if not df.empty:
         _heatmaps(df, out / "heatmaps", figure_formats)
     return df
