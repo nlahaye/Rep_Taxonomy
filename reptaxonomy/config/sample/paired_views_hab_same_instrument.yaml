@@ -1,0 +1,77 @@
+# Same-instrument representation study (SIT-FUSE HAB, southern / central California, 4 km L3m grid).
+# Question: does one encoder shared across platforms of an instrument (OLCI S3A+S3B, VIIRS SNPP+JPSS1+JPSS2) give
+# platform-consistent and physically informative representations, compared with one encoder per platform?
+#
+# Bundles are written by SIT-FUSE (sit_fuse.pipelines.habs.followon.embed_views pair): rows are the same date and
+# grid cell seen by every view; groups = 14-day block x ~1.3 degree tile (bootstrap and CV blocks).
+# View names: <instrument><encoder>_<platform>
+#   oj = OLCI joint (production) encoder, oa / ob = S3A-only / S3B-only encoder
+#   vj = VIIRS joint encoder, vs / v1 / v2 = SNPP-only / JPSS1-only / JPSS2-only encoder
+#
+#   python -m reptaxonomy.intercompare.paired_views -y paired_views_hab_same_instrument.yaml
+paired_views:
+  out_dir: /mnt/data1/HAB_COMBINED_RUNS/MERGED_TEST_111526/followon/same_instrument/rep_taxonomy
+  inputs:
+    olci: /mnt/data1/HAB_COMBINED_RUNS/MERGED_TEST_111526/followon/same_instrument/bundles/bundle_olci.npz
+    viirs: /mnt/data1/HAB_COMBINED_RUNS/MERGED_TEST_111526/followon/same_instrument/bundles/bundle_viirs.npz
+  max_rows: 20000
+  debiased_max_rows: 3000
+  metrics: [linear_cka, linear_cka_debiased, knn_jaccard, procrustes, ridge_r2]
+  knn: {k: 10, metric: euclidean, standardize: true}
+  ridge: {alphas: [0.1, 1, 10, 100, 1000], n_folds: 5}
+  bootstrap: {n: 200, seed: 0}
+
+  pairs:
+    # cross-platform consistency, shared encoder
+    - [olci:view__oj_s3a, olci:view__oj_s3b]
+    - [viirs:view__vj_snpp, viirs:view__vj_j1]
+    - [viirs:view__vj_snpp, viirs:view__vj_j2]
+    - [viirs:view__vj_j1, viirs:view__vj_j2]
+    # cross-platform consistency, per-platform encoders (each on its own platform)
+    - [olci:view__oa_s3a, olci:view__ob_s3b]
+    - [viirs:view__vs_snpp, viirs:view__v1_j1]
+    - [viirs:view__vs_snpp, viirs:view__v2_j2]
+    - [viirs:view__v1_j1, viirs:view__v2_j2]
+    # platform effect with the encoder held fixed (single-platform encoder applied to both OLCI platforms)
+    - [olci:view__oa_s3a, olci:view__oa_s3b]
+    - [olci:view__ob_s3a, olci:view__ob_s3b]
+    # encoder effect with the data held fixed
+    - [olci:view__oj_s3a, olci:view__oa_s3a]
+    - [olci:view__oj_s3b, olci:view__ob_s3b]
+    - [viirs:view__vj_snpp, viirs:view__vs_snpp]
+    - [viirs:view__vj_j1, viirs:view__v1_j1]
+    - [viirs:view__vj_j2, viirs:view__v2_j2]
+
+  # parent-cluster assignments: does a pixel get the same cluster from each platform?
+  label_pairs:
+    - [olci:labels__oj_s3a, olci:labels__oj_s3b]
+    - [viirs:labels__vj_snpp, viirs:labels__vj_j1]
+    - [viirs:labels__vj_j1, viirs:labels__vj_j2]
+
+  # physical content of each representation (targets from MUR SST and the L3m CHL product of S3A / JPSS1)
+  probes:
+    views: [olci:view__oj_s3a, olci:view__oj_s3b, olci:view__oa_s3a, olci:view__ob_s3b,
+            viirs:view__vj_snpp, viirs:view__vj_j1, viirs:view__vj_j2,
+            viirs:view__vs_snpp, viirs:view__v1_j1, viirs:view__v2_j2]
+    targets: [olci:target__sst, olci:target__sst_anom, olci:target__phys_chlor_a]
+  transfer:
+    # a probe fit on one platform's embeddings applied to the other platform's (same encoder, same rows)
+    cross_view:
+      - {fit: olci:view__oj_s3a, apply: olci:view__oj_s3b, targets: [olci:target__sst, olci:target__phys_chlor_a]}
+      - {fit: olci:view__oa_s3a, apply: olci:view__oa_s3b, targets: [olci:target__sst, olci:target__phys_chlor_a]}
+      - {fit: viirs:view__vj_j1, apply: viirs:view__vj_j2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+
+  contrasts:            # metrics with block-bootstrap CI: linear_cka, procrustes
+    # > 0: the shared encoder is more platform-consistent than separate encoders
+    - {name: olci_shared_vs_separate, metric: linear_cka,
+       pair_1: [olci:view__oj_s3a, olci:view__oj_s3b], pair_2: [olci:view__oa_s3a, olci:view__ob_s3b]}
+    - {name: olci_shared_vs_separate_procrustes, metric: procrustes,
+       pair_1: [olci:view__oj_s3a, olci:view__oj_s3b], pair_2: [olci:view__oa_s3a, olci:view__ob_s3b]}
+    - {name: viirs_shared_vs_separate_j1j2, metric: linear_cka,
+       pair_1: [viirs:view__vj_j1, viirs:view__vj_j2], pair_2: [viirs:view__v1_j1, viirs:view__v2_j2]}
+    - {name: viirs_shared_vs_separate_snpp_j1, metric: linear_cka,
+       pair_1: [viirs:view__vj_snpp, viirs:view__vj_j1], pair_2: [viirs:view__vs_snpp, viirs:view__v1_j1]}
+    # how much of the separate-encoder difference is the platform (data) rather than the encoder
+    - {name: olci_platform_vs_encoder, metric: linear_cka,
+       pair_1: [olci:view__oa_s3a, olci:view__oa_s3b], pair_2: [olci:view__oa_s3a, olci:view__ob_s3b]}
+  resume: {check_config: true}
