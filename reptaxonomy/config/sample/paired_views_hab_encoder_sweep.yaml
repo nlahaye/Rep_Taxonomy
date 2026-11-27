@@ -1,0 +1,122 @@
+# Encoder sweep representation study (SIT-FUSE HAB, VIIRS SNPP / JPSS1 / JPSS2, 4 km L3m grid, 2025 scenes).
+# Questions: (1) how far is each encoder's representation from the production DBN, relative to the difference
+# that retraining alone produces (dbn_seed1 vs dbn_prod)? (2) is each encoder consistent across platforms on the
+# same day? (3) how much SST / SST anomaly / chlorophyll does each representation carry linearly?
+#
+# Bundle written by SIT-FUSE (sit_fuse.pipelines.habs.followon.embed_views pair): rows are the same date and grid
+# cell seen by all 24 views; groups = 14-day block x ~1.3 degree tile (bootstrap and CV blocks).
+# View names: <arm>_<platform>, arm in dbn_prod, dbn_seed1, pca, conv_dbn, ijepa, byol, mae, rtdbn.
+#
+#   python -m reptaxonomy.intercompare.paired_views -y paired_views_hab_encoder_sweep.yaml
+paired_views:
+  out_dir: /mnt/data1/HAB_COMBINED_RUNS/MERGED_TEST_111526/followon/encoder_sweep/rep_taxonomy
+  inputs:
+    viirs: /mnt/data1/HAB_COMBINED_RUNS/MERGED_TEST_111526/followon/encoder_sweep/bundles/bundle_viirs.npz
+  max_rows: 20000
+  debiased_max_rows: 3000
+  metrics: [linear_cka, linear_cka_debiased, knn_jaccard, procrustes, ridge_r2]
+  knn: {k: 10, metric: euclidean, standardize: true}
+  ridge: {alphas: [0.1, 1, 10, 100, 1000], n_folds: 5}
+  bootstrap: {n: 200, seed: 0}
+
+  pairs:
+    # encoder effect, data held fixed (JPSS1); dbn_seed1 is the retraining floor
+    - [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__pca_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__conv_dbn_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__ijepa_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__byol_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__mae_jpss1, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__rtdbn_jpss1, viirs:view__dbn_prod_jpss1]
+    # same, SNPP (checks that the ordering does not depend on the platform)
+    - [viirs:view__dbn_seed1_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__pca_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__conv_dbn_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__ijepa_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__byol_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__mae_snpp, viirs:view__dbn_prod_snpp]
+    - [viirs:view__rtdbn_snpp, viirs:view__dbn_prod_snpp]
+    # cross-platform consistency of each encoder, same day and cell
+    - [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]
+    - [viirs:view__dbn_prod_jpss1, viirs:view__dbn_prod_jpss2]
+    - [viirs:view__dbn_seed1_snpp, viirs:view__dbn_seed1_jpss1]
+    - [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_seed1_jpss2]
+    - [viirs:view__pca_snpp, viirs:view__pca_jpss1]
+    - [viirs:view__pca_jpss1, viirs:view__pca_jpss2]
+    - [viirs:view__conv_dbn_snpp, viirs:view__conv_dbn_jpss1]
+    - [viirs:view__conv_dbn_jpss1, viirs:view__conv_dbn_jpss2]
+    - [viirs:view__ijepa_snpp, viirs:view__ijepa_jpss1]
+    - [viirs:view__ijepa_jpss1, viirs:view__ijepa_jpss2]
+    - [viirs:view__byol_snpp, viirs:view__byol_jpss1]
+    - [viirs:view__byol_jpss1, viirs:view__byol_jpss2]
+    - [viirs:view__mae_snpp, viirs:view__mae_jpss1]
+    - [viirs:view__mae_jpss1, viirs:view__mae_jpss2]
+    - [viirs:view__rtdbn_snpp, viirs:view__rtdbn_jpss1]
+    - [viirs:view__rtdbn_jpss1, viirs:view__rtdbn_jpss2]
+
+  # parent-cluster assignments (100 clusters): same cluster from each platform?
+  label_pairs:
+    - [viirs:labels__dbn_prod_snpp, viirs:labels__dbn_prod_jpss1]
+    - [viirs:labels__dbn_seed1_snpp, viirs:labels__dbn_seed1_jpss1]
+    - [viirs:labels__pca_snpp, viirs:labels__pca_jpss1]
+    - [viirs:labels__conv_dbn_snpp, viirs:labels__conv_dbn_jpss1]
+    - [viirs:labels__ijepa_snpp, viirs:labels__ijepa_jpss1]
+    - [viirs:labels__byol_snpp, viirs:labels__byol_jpss1]
+    - [viirs:labels__mae_snpp, viirs:labels__mae_jpss1]
+    - [viirs:labels__rtdbn_snpp, viirs:labels__rtdbn_jpss1]
+
+  # physical content of each representation (MUR SST, SST anomaly, JPSS1 L3m CHL)
+  probes:
+    views: [viirs:view__dbn_prod_jpss1, viirs:view__dbn_seed1_jpss1, viirs:view__pca_jpss1, viirs:view__conv_dbn_jpss1, viirs:view__ijepa_jpss1, viirs:view__byol_jpss1, viirs:view__mae_jpss1, viirs:view__rtdbn_jpss1]
+    targets: [viirs:target__sst, viirs:target__sst_anom, viirs:target__phys_chlor_a]
+  transfer:
+    # probe fit on SNPP embeddings applied to JPSS2 embeddings of the same encoder
+    cross_view:
+      - {fit: viirs:view__dbn_prod_snpp, apply: viirs:view__dbn_prod_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__pca_snpp, apply: viirs:view__pca_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__conv_dbn_snpp, apply: viirs:view__conv_dbn_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__ijepa_snpp, apply: viirs:view__ijepa_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__byol_snpp, apply: viirs:view__byol_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__mae_snpp, apply: viirs:view__mae_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+      - {fit: viirs:view__rtdbn_snpp, apply: viirs:view__rtdbn_jpss2, targets: [viirs:target__sst, viirs:target__phys_chlor_a]}
+
+  contrasts:            # block-bootstrap CI
+    # < 0: the arm differs from dbn_prod by more than retraining does
+    - {name: pca_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__pca_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: pca_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__pca_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: conv_dbn_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__conv_dbn_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: conv_dbn_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__conv_dbn_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: ijepa_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__ijepa_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: ijepa_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__ijepa_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: byol_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__byol_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: byol_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__byol_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: mae_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__mae_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: mae_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__mae_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: rtdbn_vs_seed_floor, metric: linear_cka,
+       pair_1: [viirs:view__rtdbn_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    - {name: rtdbn_vs_seed_floor_procrustes, metric: procrustes,
+       pair_1: [viirs:view__rtdbn_jpss1, viirs:view__dbn_prod_jpss1], pair_2: [viirs:view__dbn_seed1_jpss1, viirs:view__dbn_prod_jpss1]}
+    # > 0: the arm is more platform-consistent (SNPP vs JPSS1) than the production DBN
+    - {name: pca_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__pca_snpp, viirs:view__pca_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+    - {name: conv_dbn_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__conv_dbn_snpp, viirs:view__conv_dbn_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+    - {name: ijepa_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__ijepa_snpp, viirs:view__ijepa_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+    - {name: byol_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__byol_snpp, viirs:view__byol_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+    - {name: mae_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__mae_snpp, viirs:view__mae_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+    - {name: rtdbn_platform_consistency_vs_prod, metric: linear_cka,
+       pair_1: [viirs:view__rtdbn_snpp, viirs:view__rtdbn_jpss1], pair_2: [viirs:view__dbn_prod_snpp, viirs:view__dbn_prod_jpss1]}
+  resume: {check_config: true}
